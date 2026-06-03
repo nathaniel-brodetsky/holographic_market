@@ -1,0 +1,8 @@
+numpy>=2.1.0
+scipy>=1.14.0
+sparse>=0.15.0
+tensornetwork>=0.4.6
+jax>=0.4.35
+jaxlib>=0.4.35
+networkx>=3.4.0
+matplotlib>=3.9.0
