@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG -flto=auto -fno-fat-lto-objects -flto -Wl,--dependency-file=CMakeFiles/holographic_bench.dir/link.d CMakeFiles/holographic_bench.dir/src/main.cpp.o -o bin/holographic_bench
