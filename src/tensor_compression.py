@@ -77,9 +77,7 @@ def _left_canonical_svd_sweep(
 
         sv_matrix: NDArray[np.float32] = np.diag(s_trunc) @ vt_trunc
         next_row: NDArray[np.float32] = chain[site + 1].reshape(1, phys_dim).astype(np.float32)
-        current_matrix = (sv_matrix @ next_row.T).T
-        if current_matrix.shape[0] != rank:
-            current_matrix = current_matrix.reshape(rank, phys_dim)
+        current_matrix = sv_matrix * next_row
 
     nodes.append(tn.Node(current_matrix.astype(np.float32), name=f"A_{n_sites - 1}"))
     bond_dims.append(1)

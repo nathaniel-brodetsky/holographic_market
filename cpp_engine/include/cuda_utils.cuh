@@ -1,184 +1,225 @@
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <cusparse.h>
 #include <cusolverDn.h>
 
 namespace holo::cuda {
-#define CUDA_CHECK(expr)                                                    \
-    do {                                                                    \
-        cudaError_t _e = (expr);                                            \
-        if (_e != cudaSuccess) {                                            \
-            ::std::fprintf(stderr,                                          \
-                "[CUDA] %s:%d  %s  →  %s\n",                              \
-                __FILE__, __LINE__, #expr, cudaGetErrorString(_e));         \
-            ::std::abort();                                                 \
-        }                                                                   \
+
+#define CUDA_CHECK(expr)                                                       \
+    do {                                                                       \
+        cudaError_t _holo_err = (expr);                                        \
+        if (_holo_err != cudaSuccess) [[unlikely]] {                           \
+            ::std::fprintf(stderr,                                             \
+                "[CUDA_CHECK] %s:%d  »%s«  →  %s (%d)\n",                    \
+                __FILE__, __LINE__, #expr,                                     \
+                ::cudaGetErrorString(_holo_err),                               \
+                static_cast<int>(_holo_err));                                  \
+            ::std::abort();                                                    \
+        }                                                                      \
     } while (0)
 
-#define CUBLAS_CHECK(expr)                                                  \
-    do {                                                                    \
-        cublasStatus_t _s = (expr);                                         \
-        if (_s != CUBLAS_STATUS_SUCCESS) {                                  \
-            ::std::fprintf(stderr,                                          \
-                "[cuBLAS] %s:%d  %s  →  status %d\n",                     \
-                __FILE__, __LINE__, #expr, static_cast<int>(_s));           \
-            ::std::abort();                                                 \
-        }                                                                   \
+#define CUBLAS_CHECK(expr)                                                     \
+    do {                                                                       \
+        cublasStatus_t _holo_stat = (expr);                                    \
+        if (_holo_stat != CUBLAS_STATUS_SUCCESS) [[unlikely]] {                \
+            ::std::fprintf(stderr,                                             \
+                "[CUBLAS_CHECK] %s:%d  »%s«  →  status %d\n",                \
+                __FILE__, __LINE__, #expr,                                     \
+                static_cast<int>(_holo_stat));                                 \
+            ::std::abort();                                                    \
+        }                                                                      \
     } while (0)
 
-#define CUSPARSE_CHECK(expr)                                                \
-    do {                                                                    \
-        cusparseStatus_t _s = (expr);                                       \
-        if (_s != CUSPARSE_STATUS_SUCCESS) {                                \
-            ::std::fprintf(stderr,                                          \
-                "[cuSPARSE] %s:%d  %s  →  %s\n",                          \
-                __FILE__, __LINE__, #expr,                                  \
-                cusparseGetErrorString(_s));                                \
-            ::std::abort();                                                 \
-        }                                                                   \
+#define CUSPARSE_CHECK(expr)                                                   \
+    do {                                                                       \
+        cusparseStatus_t _holo_stat = (expr);                                  \
+        if (_holo_stat != CUSPARSE_STATUS_SUCCESS) [[unlikely]] {              \
+            ::std::fprintf(stderr,                                             \
+                "[CUSPARSE_CHECK] %s:%d  »%s«  →  %s (%d)\n",                \
+                __FILE__, __LINE__, #expr,                                     \
+                ::cusparseGetErrorString(_holo_stat),                          \
+                static_cast<int>(_holo_stat));                                 \
+            ::std::abort();                                                    \
+        }                                                                      \
     } while (0)
 
-#define CUSOLVER_CHECK(expr)                                                \
-    do {                                                                    \
-        cusolverStatus_t _s = (expr);                                       \
-        if (_s != CUSOLVER_STATUS_SUCCESS) {                                \
-            ::std::fprintf(stderr,                                          \
-                "[cuSOLVER] %s:%d  %s  →  status %d\n",                   \
-                __FILE__, __LINE__, #expr, static_cast<int>(_s));           \
-            ::std::abort();                                                 \
-        }                                                                   \
+#define CUSOLVER_CHECK(expr)                                                   \
+    do {                                                                       \
+        cusolverStatus_t _holo_stat = (expr);                                  \
+        if (_holo_stat != CUSOLVER_STATUS_SUCCESS) [[unlikely]] {              \
+            ::std::fprintf(stderr,                                             \
+                "[CUSOLVER_CHECK] %s:%d  »%s«  →  status %d\n",              \
+                __FILE__, __LINE__, #expr,                                     \
+                static_cast<int>(_holo_stat));                                 \
+            ::std::abort();                                                    \
+        }                                                                      \
     } while (0)
 
-    struct CudaHandles {
-        cublasHandle_t cublas{nullptr};
-        cusparseHandle_t cusparse{nullptr};
-        cusolverDnHandle_t cusolver{nullptr};
+template<typename T>
+[[nodiscard]] T* device_alloc(std::size_t count) {
+    T* ptr = nullptr;
+    CUDA_CHECK(cudaMalloc(
+        reinterpret_cast<void**>(&ptr),
+        sizeof(T) * count));
+    return ptr;
+}
 
-        CudaHandles() {
-            CUBLAS_CHECK(cublasCreate(&cublas));
-            CUSPARSE_CHECK(cusparseCreate(&cusparse));
-            CUSOLVER_CHECK(cusolverDnCreate(&cusolver));
-        }
+template<typename T>
+void device_free(T* ptr) noexcept {
+    if (ptr != nullptr) {
+        cudaFree(reinterpret_cast<void*>(ptr));
+    }
+}
 
-        ~CudaHandles() {
-            if (cublas) cublasDestroy(cublas);
-            if (cusparse) cusparseDestroy(cusparse);
-            if (cusolver) cusolverDnDestroy(cusolver);
-        }
+template<typename T>
+[[nodiscard]] T* pinned_alloc(std::size_t count) {
+    T* ptr = nullptr;
+    CUDA_CHECK(cudaMallocHost(
+        reinterpret_cast<void**>(&ptr),
+        sizeof(T) * count));
+    return ptr;
+}
 
-        CudaHandles(const CudaHandles &) = delete;
+template<typename T>
+void pinned_free(T* ptr) noexcept {
+    if (ptr != nullptr) {
+        cudaFreeHost(reinterpret_cast<void*>(ptr));
+    }
+}
 
-        CudaHandles &operator=(const CudaHandles &) = delete;
-
-        CudaHandles(CudaHandles &&) = delete;
-
-        CudaHandles &operator=(CudaHandles &&) = delete;
-    };
-
-    [[nodiscard]] inline int query_sm_count() noexcept {
-        int device = 0;
-        int sm_count = 0;
-        cudaGetDevice(&device);
-        cudaDeviceGetAttribute(&sm_count,
-                               cudaDevAttrMultiProcessorCount, device);
-        return sm_count;
+class StreamGuard final {
+public:
+    StreamGuard() {
+        CUDA_CHECK(cudaStreamCreateWithFlags(
+            &stream_, cudaStreamNonBlocking));
     }
 
-    [[nodiscard]] inline int query_warp_size() noexcept {
-        int device = 0;
-        int warp = 32;
-        cudaGetDevice(&device);
-        cudaDeviceGetAttribute(&warp, cudaDevAttrWarpSize, device);
-        return warp;
+    ~StreamGuard() noexcept {
+        if (stream_ != nullptr) {
+            cudaStreamDestroy(stream_);
+        }
     }
 
-    [[nodiscard]] inline size_t query_shared_mem_per_block() noexcept {
-        int device = 0;
-        int smem = 0;
-        cudaGetDevice(&device);
-        cudaDeviceGetAttribute(&smem,
-                               cudaDevAttrMaxSharedMemoryPerBlock, device);
-        return static_cast<size_t>(smem);
+    StreamGuard(const StreamGuard&)            = delete;
+    StreamGuard& operator=(const StreamGuard&) = delete;
+    StreamGuard(StreamGuard&&)                 = delete;
+    StreamGuard& operator=(StreamGuard&&)      = delete;
+
+    void sync() const {
+        CUDA_CHECK(cudaStreamSynchronize(stream_));
     }
 
-    template<typename T>
-    [[nodiscard]] T *device_alloc(size_t count) {
-        T *ptr = nullptr;
-        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&ptr),
-            sizeof(T) * count));
-        return ptr;
+    [[nodiscard]] operator cudaStream_t() const noexcept {
+        return stream_;
     }
 
-    template<typename T>
-    void device_free(T *ptr) noexcept {
-        if (ptr) cudaFree(ptr);
+    [[nodiscard]] cudaStream_t get() const noexcept {
+        return stream_;
     }
 
-    template<typename T>
-    [[nodiscard]] T *pinned_alloc(size_t count) {
-        T *ptr = nullptr;
-        CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&ptr),
-            sizeof(T) * count));
-        return ptr;
+private:
+    cudaStream_t stream_{nullptr};
+};
+
+class EventGuard final {
+public:
+    explicit EventGuard(unsigned int flags = cudaEventDefault) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&event_, flags));
     }
 
-    template<typename T>
-    void pinned_free(T *ptr) noexcept {
-        if (ptr) cudaFreeHost(ptr);
+    ~EventGuard() noexcept {
+        if (event_ != nullptr) {
+            cudaEventDestroy(event_);
+        }
     }
 
-    struct StreamGuard {
-        cudaStream_t stream{nullptr};
+    EventGuard(const EventGuard&)            = delete;
+    EventGuard& operator=(const EventGuard&) = delete;
+    EventGuard(EventGuard&&)                 = delete;
+    EventGuard& operator=(EventGuard&&)      = delete;
 
-        StreamGuard() {
-            CUDA_CHECK(cudaStreamCreateWithFlags(
-                &stream, cudaStreamNonBlocking));
-        }
+    void record(cudaStream_t stream) {
+        CUDA_CHECK(cudaEventRecord(event_, stream));
+    }
 
-        ~StreamGuard() noexcept {
-            if (stream) cudaStreamDestroy(stream);
-        }
+    [[nodiscard]] float elapsed_ms(const EventGuard& start) const {
+        float ms = 0.0F;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, start.event_, event_));
+        return ms;
+    }
 
-        StreamGuard(const StreamGuard &) = delete;
+    [[nodiscard]] operator cudaEvent_t() const noexcept {
+        return event_;
+    }
 
-        StreamGuard &operator=(const StreamGuard &) = delete;
+    [[nodiscard]] cudaEvent_t get() const noexcept {
+        return event_;
+    }
 
-        void sync() const {
-            CUDA_CHECK(cudaStreamSynchronize(stream));
-        }
+private:
+    cudaEvent_t event_{nullptr};
+};
 
-        operator cudaStream_t() const noexcept { return stream; }
-    };
+class CudaHandles final {
+public:
+    CudaHandles() {
+        CUBLAS_CHECK  (cublasCreate  (&cublas_));
+        CUSPARSE_CHECK(cusparseCreate(&cusparse_));
+        CUSOLVER_CHECK(cusolverDnCreate(&cusolver_));
+    }
 
-    struct EventGuard {
-        cudaEvent_t event{nullptr};
+    ~CudaHandles() noexcept {
+        if (cublas_)   cublasDestroy(cublas_);
+        if (cusparse_) cusparseDestroy(cusparse_);
+        if (cusolver_) cusolverDnDestroy(cusolver_);
+    }
 
-        explicit EventGuard(unsigned flags = cudaEventDefault) {
-            CUDA_CHECK(cudaEventCreateWithFlags(&event, flags));
-        }
+    CudaHandles(const CudaHandles&)            = delete;
+    CudaHandles& operator=(const CudaHandles&) = delete;
+    CudaHandles(CudaHandles&&)                 = delete;
+    CudaHandles& operator=(CudaHandles&&)      = delete;
 
-        ~EventGuard() noexcept {
-            if (event) cudaEventDestroy(event);
-        }
+    void set_stream(cudaStream_t s) {
+        CUBLAS_CHECK  (cublasSetStream  (cublas_,   s));
+        CUSPARSE_CHECK(cusparseSetStream(cusparse_, s));
+        CUSOLVER_CHECK(cusolverDnSetStream(cusolver_, s));
+    }
 
-        EventGuard(const EventGuard &) = delete;
+    [[nodiscard]] cublasHandle_t     cublas()   const noexcept { return cublas_;   }
+    [[nodiscard]] cusparseHandle_t   cusparse() const noexcept { return cusparse_; }
+    [[nodiscard]] cusolverDnHandle_t cusolver() const noexcept { return cusolver_; }
 
-        EventGuard &operator=(const EventGuard &) = delete;
+private:
+    cublasHandle_t     cublas_  {nullptr};
+    cusparseHandle_t   cusparse_{nullptr};
+    cusolverDnHandle_t cusolver_{nullptr};
+};
 
-        void record(cudaStream_t stream) {
-            CUDA_CHECK(cudaEventRecord(event, stream));
-        }
+[[nodiscard]] inline int query_sm_count(int device = 0) noexcept {
+    int val = 0;
+    cudaDeviceGetAttribute(
+        &val, cudaDevAttrMultiProcessorCount, device);
+    return val;
+}
 
-        float elapsed_ms(const EventGuard &start) const {
-            float ms = 0.0F;
-            CUDA_CHECK(cudaEventElapsedTime(&ms, start.event, event));
-            return ms;
-        }
+[[nodiscard]] inline std::size_t query_shared_mem_per_block(int device = 0) noexcept {
+    int val = 0;
+    cudaDeviceGetAttribute(
+        &val, cudaDevAttrMaxSharedMemoryPerBlock, device);
+    return static_cast<std::size_t>(val);
+}
 
-        operator cudaEvent_t() const noexcept { return event; }
-    };
+[[nodiscard]] inline std::size_t query_global_mem(int device = 0) noexcept {
+    cudaDeviceProp prop{};
+    cudaGetDeviceProperties(&prop, device);
+    return prop.totalGlobalMem;
+}
+
 } // namespace holo::cuda

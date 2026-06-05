@@ -41,10 +41,10 @@ target_compile_options(engine_compile_options INTERFACE
 )
 
 check_cxx_compiler_flag(-flto HAS_LTO)
-if(HAS_LTO)
+if (HAS_LTO)
     target_compile_options(engine_compile_options INTERFACE -flto)
     target_link_options(engine_compile_options INTERFACE -flto)
-endif()
+endif ()
 
 set(CMAKE_REQUIRED_FLAGS "-mavx512f")
 check_cxx_source_runs("
@@ -58,21 +58,22 @@ int main() {
 " AVX512_RUNS)
 unset(CMAKE_REQUIRED_FLAGS)
 
-if(AVX512_RUNS)
+if (AVX512_RUNS)
     target_compile_options(engine_compile_options INTERFACE
             -mavx512f -mavx512bw -mavx512dq -mavx512vl)
     target_compile_definitions(engine_compile_options INTERFACE ARCH_HAS_AVX512=1)
-    message(STATUS "AVX-512 : verified")
-else()
+    message(STATUS "AVX-512 : verified at runtime")
+else ()
     check_cxx_compiler_flag(-mavx2 HAS_AVX2)
-    if(HAS_AVX2)
+    if (HAS_AVX2)
         target_compile_options(engine_compile_options INTERFACE -mavx2 -mfma)
         target_compile_definitions(engine_compile_options INTERFACE ARCH_HAS_AVX2=1)
         message(STATUS "AVX-512 : unavailable, AVX2 fallback")
-    endif()
-endif()
+    endif ()
+endif ()
 
-set(CUDA_ARCH "native" CACHE STRING "CUDA architectures e.g. 80;86;89;90")
+set(CMAKE_CUDA_ARCHITECTURES "native" CACHE STRING
+        "CUDA architectures to compile for (e.g. 86, 89, 90, native)")
 
 add_library(cuda_compile_options INTERFACE)
 target_compile_options(cuda_compile_options INTERFACE
@@ -82,30 +83,16 @@ target_compile_options(cuda_compile_options INTERFACE
         --expt-relaxed-constexpr
         --expt-extended-lambda
         -lineinfo
+        --generate-line-info
         -Xcompiler=-fno-exceptions
         -Xcompiler=-fno-rtti
         -Xcompiler=-fvisibility=hidden
         -Xptxas=-v
         -Xptxas=--allow-expensive-optimizations=true
-        --generate-line-info
         >
 )
 
-set_property(TARGET cuda_compile_options
-        PROPERTY CUDA_ARCHITECTURES ${CUDA_ARCH})
-
 find_package(Threads REQUIRED)
-
-set(HOLOGRAPHIC_HEADERS
-        include/memory_arena.hpp
-        include/lockfree_ring_buffer.hpp
-        include/lob_core.hpp
-        include/cuda_utils.cuh
-        include/gpu_lob_mirror.cuh
-        include/lobpcg_solver.cuh
-        include/hodge_kernel.cuh
-        include/cuda_pipeline.cuh
-)
 
 add_executable(holographic_bench
         src/main.cpp
@@ -132,20 +119,28 @@ target_link_libraries(holographic_bench PRIVATE
 )
 
 set_target_properties(holographic_bench PROPERTIES
-        RUNTIME_OUTPUT_DIRECTORY        ${CMAKE_BINARY_DIR}/bin
-        CUDA_SEPARABLE_COMPILATION      ON
-        CUDA_RESOLVE_DEVICE_SYMBOLS     ON
-        INTERPROCEDURAL_OPTIMIZATION    ${HAS_LTO}
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+        CUDA_SEPARABLE_COMPILATION ON
+        CUDA_RESOLVE_DEVICE_SYMBOLS ON
+        INTERPROCEDURAL_OPTIMIZATION ${HAS_LTO}
 )
 
 option(ENABLE_ASAN "AddressSanitizer" OFF)
-if(ENABLE_ASAN)
-    target_compile_options(holographic_bench PRIVATE -fsanitize=address,undefined)
-    target_link_options(holographic_bench PRIVATE -fsanitize=address,undefined)
-endif()
+if (ENABLE_ASAN)
+    target_compile_options(holographic_bench PRIVATE
+            -fsanitize=address,undefined)
+    target_link_options(holographic_bench PRIVATE
+            -fsanitize=address,undefined)
+endif ()
 
-message(STATUS "Build type   : ${CMAKE_BUILD_TYPE}")
-message(STATUS "Compiler     : ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
-message(STATUS "CUDA toolkit : ${CUDAToolkit_VERSION}")
-message(STATUS "CUDA arch    : ${CUDA_ARCH}")
-message(STATUS "LTO          : ${HAS_LTO}")
+option(ENABLE_TSAN "ThreadSanitizer" OFF)
+if (ENABLE_TSAN)
+    target_compile_options(holographic_bench PRIVATE -fsanitize=thread)
+    target_link_options(holographic_bench PRIVATE -fsanitize=thread)
+endif ()
+
+message(STATUS "Build type        : ${CMAKE_BUILD_TYPE}")
+message(STATUS "Compiler          : ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
+message(STATUS "CUDA toolkit      : ${CUDAToolkit_VERSION}")
+message(STATUS "CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
+message(STATUS "LTO               : ${HAS_LTO}")

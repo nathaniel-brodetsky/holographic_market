@@ -1,0 +1,12 @@
+# Виртуальные окружения Python
+.venv_holographic/
+venv/
+.env/
+
+# Настройки IDE (CLion, PyCharm, VS Code и т.д.)
+.idea/
+.vscode/
+
+# Папки сборки C++ / CMake
+build/
+cmake-build-*/
