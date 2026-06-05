@@ -9,36 +9,39 @@
 #include <cassert>
 #include <new>
 
-namespace holo {
+namespace holo
+{
     static constexpr std::size_t k_cache_line = 64U;
     static constexpr std::size_t k_page_size = 4096U;
     static constexpr std::size_t k_arena_align = k_page_size;
 
-    template<typename T>
+    template <typename T>
     concept ArenaAllocatable =
-            std::is_trivially_destructible_v<T> &&
-            std::is_standard_layout_v<T>;
+        std::is_trivially_destructible_v<T> &&
+        std::is_standard_layout_v<T>;
 
     [[nodiscard]] constexpr std::size_t align_up(
         std::size_t value,
-        std::size_t alignment) noexcept {
+        std::size_t alignment) noexcept
+    {
         assert((alignment & (alignment - 1U)) == 0U);
         return (value + alignment - 1U) & ~(alignment - 1U);
     }
 
-    class MemoryArena final {
+    class MemoryArena final
+    {
     public:
         explicit MemoryArena(std::size_t capacity_bytes)
-            : capacity_{align_up(capacity_bytes, k_arena_align)}
-              , base_{
-                  static_cast<std::byte *>(
-                      ::operator new(capacity_, std::align_val_t{k_arena_align}))
-              }
-              , cursor_{0U} {
+            : capacity_{align_up(capacity_bytes, k_arena_align)}, base_{
+                                                                      static_cast<std::byte *>(
+                                                                          ::operator new(capacity_, std::align_val_t{k_arena_align}))},
+              cursor_{0U}
+        {
             std::memset(base_, 0, capacity_);
         }
 
-        ~MemoryArena() noexcept {
+        ~MemoryArena() noexcept
+        {
             ::operator delete(base_, std::align_val_t{k_arena_align});
         }
 
@@ -50,15 +53,17 @@ namespace holo {
 
         MemoryArena &operator=(MemoryArena &&) = delete;
 
-        template<ArenaAllocatable T>
-        [[nodiscard]] T *alloc(std::size_t count = 1U) noexcept {
+        template <ArenaAllocatable T>
+        [[nodiscard]] T *alloc(std::size_t count = 1U) noexcept
+        {
             const std::size_t alignment = alignof(T) < k_cache_line
                                               ? alignof(T)
                                               : k_cache_line;
             const std::size_t aligned_cursor = align_up(cursor_, alignment);
             const std::size_t required = sizeof(T) * count;
 
-            if (aligned_cursor + required > capacity_) [[unlikely]] {
+            if (aligned_cursor + required > capacity_) [[unlikely]]
+            {
                 return nullptr;
             }
 
@@ -67,19 +72,27 @@ namespace holo {
             return ptr;
         }
 
-        template<ArenaAllocatable T>
-        [[nodiscard]] std::span<T> alloc_span(std::size_t count) noexcept {
+        template <ArenaAllocatable T>
+        [[nodiscard]] std::span<T> alloc_span(std::size_t count) noexcept
+        {
             T *const ptr = alloc<T>(count);
-            if (ptr == nullptr) [[unlikely]] { return {}; }
+            if (ptr == nullptr) [[unlikely]]
+            {
+                return {};
+            }
             return std::span<T>{ptr, count};
         }
 
-        template<ArenaAllocatable T, typename... Args>
+        template <ArenaAllocatable T, typename... Args>
             requires std::is_constructible_v<T, Args...>
-        [[nodiscard]] T *emplace(Args &&... args) noexcept {
+        [[nodiscard]] T *emplace(Args &&...args) noexcept
+        {
             T *const ptr = alloc<T>(1U);
-            if (ptr == nullptr) [[unlikely]] { return nullptr; }
-            ::new(ptr) T(static_cast<Args &&>(args)...);
+            if (ptr == nullptr) [[unlikely]]
+            {
+                return nullptr;
+            }
+            ::new (ptr) T(static_cast<Args &&>(args)...);
             return ptr;
         }
 
@@ -89,7 +102,8 @@ namespace holo {
         [[nodiscard]] std::size_t capacity() const noexcept { return capacity_; }
         [[nodiscard]] std::size_t remaining() const noexcept { return capacity_ - cursor_; }
 
-        [[nodiscard]] double utilization() const noexcept {
+        [[nodiscard]] double utilization() const noexcept
+        {
             return static_cast<double>(cursor_) / static_cast<double>(capacity_);
         }
 

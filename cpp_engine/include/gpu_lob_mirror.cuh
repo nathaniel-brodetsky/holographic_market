@@ -8,11 +8,13 @@
 #include <memory_arena.hpp>
 #include <lob_core.hpp>
 
-namespace holo::cuda {
+namespace holo::cuda
+{
     static constexpr size_t k_gpu_max_instruments = 512U;
     static constexpr size_t k_gpu_max_depth = 16U;
 
-    struct alignas(16) GpuLobSnapshot {
+    struct alignas(16) GpuLobSnapshot
+    {
         float *d_bid_prices;
         float *d_ask_prices;
         float *d_bid_qtys;
@@ -23,30 +25,28 @@ namespace holo::cuda {
         uint64_t transfer_ts_ns;
     };
 
-    class GpuLobMirror final {
+    class GpuLobMirror final
+    {
     public:
         explicit GpuLobMirror(
             const LobSoA &lob_soa,
             cudaStream_t transfer_stream)
-            : n_instruments_{lob_soa.n_instruments()}
-              , depth_{lob_soa.depth()}
-              , n_floats_{lob_soa.n_instruments() * lob_soa.depth()}
-              , stream_{transfer_stream}
-              , generation_{0U} {
+            : n_instruments_{lob_soa.n_instruments()}, depth_{lob_soa.depth()}, n_floats_{lob_soa.n_instruments() * lob_soa.depth()}, stream_{transfer_stream}, generation_{0U}
+        {
             CUDA_CHECK(cudaHostRegister(
-                const_cast<float*>(lob_soa.raw_bid_price_array().data()),
+                const_cast<float *>(lob_soa.raw_bid_price_array().data()),
                 n_floats_ * sizeof(float),
                 cudaHostRegisterDefault));
             CUDA_CHECK(cudaHostRegister(
-                const_cast<float*>(lob_soa.raw_ask_price_array().data()),
+                const_cast<float *>(lob_soa.raw_ask_price_array().data()),
                 n_floats_ * sizeof(float),
                 cudaHostRegisterDefault));
             CUDA_CHECK(cudaHostRegister(
-                const_cast<float*>(lob_soa.raw_bid_qty_array().data()),
+                const_cast<float *>(lob_soa.raw_bid_qty_array().data()),
                 n_floats_ * sizeof(float),
                 cudaHostRegisterDefault));
             CUDA_CHECK(cudaHostRegister(
-                const_cast<float*>(lob_soa.raw_ask_qty_array().data()),
+                const_cast<float *>(lob_soa.raw_ask_qty_array().data()),
                 n_floats_ * sizeof(float),
                 cudaHostRegisterDefault));
 
@@ -66,7 +66,8 @@ namespace holo::cuda {
             CUDA_CHECK(cudaMemset(d_ask_qtys_, 0, n_floats_ * sizeof(float)));
         }
 
-        ~GpuLobMirror() noexcept {
+        ~GpuLobMirror() noexcept
+        {
             device_free(d_bid_prices_);
             device_free(d_ask_prices_);
             device_free(d_bid_qtys_);
@@ -86,7 +87,8 @@ namespace holo::cuda {
 
         GpuLobMirror &operator=(GpuLobMirror &&) = delete;
 
-        void async_push(uint64_t current_generation) noexcept {
+        void async_push(uint64_t current_generation) noexcept
+        {
             CUDA_CHECK(cudaMemcpyAsync(
                 d_bid_prices_, h_bid_prices_,
                 n_floats_ * sizeof(float),
@@ -106,7 +108,8 @@ namespace holo::cuda {
             generation_ = current_generation;
         }
 
-        [[nodiscard]] GpuLobSnapshot snapshot() const noexcept {
+        [[nodiscard]] GpuLobSnapshot snapshot() const noexcept
+        {
             return GpuLobSnapshot{
                 .d_bid_prices = d_bid_prices_,
                 .d_ask_prices = d_ask_prices_,

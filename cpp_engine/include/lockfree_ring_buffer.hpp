@@ -8,15 +8,17 @@
 #include <type_traits>
 #include <memory_arena.hpp>
 
-namespace holo {
-    template<typename T>
+namespace holo
+{
+    template <typename T>
     concept RingElement =
-            std::is_trivially_copyable_v<T> &&
-            std::is_trivially_destructible_v<T>;
+        std::is_trivially_copyable_v<T> &&
+        std::is_trivially_destructible_v<T>;
 
-    template<RingElement T, std::size_t Capacity>
-        requires (Capacity >= 2U) && ((Capacity & (Capacity - 1U)) == 0U)
-    class alignas(k_cache_line) SpscRingBuffer final {
+    template <RingElement T, std::size_t Capacity>
+        requires(Capacity >= 2U) && ((Capacity & (Capacity - 1U)) == 0U)
+    class alignas(k_cache_line) SpscRingBuffer final
+    {
     public:
         static constexpr std::size_t k_capacity = Capacity;
         static constexpr std::size_t k_mask = Capacity - 1U;
@@ -27,10 +29,8 @@ namespace holo {
             "SpscRingBuffer capacity must be a power of two.");
 
         SpscRingBuffer() noexcept
-            : head_{0U}
-              , _pad0_{}
-              , tail_{0U}
-              , _pad1_{} {
+            : head_{0U}, _pad0_{}, tail_{0U}, _pad1_{}
+        {
         }
 
         SpscRingBuffer(const SpscRingBuffer &) = delete;
@@ -41,11 +41,13 @@ namespace holo {
 
         SpscRingBuffer &operator=(SpscRingBuffer &&) = delete;
 
-        [[nodiscard]] bool try_push(const T &item) noexcept {
+        [[nodiscard]] bool try_push(const T &item) noexcept
+        {
             const std::size_t head = head_.load(std::memory_order_relaxed);
             const std::size_t next = (head + 1U) & k_mask;
 
-            if (next == tail_.load(std::memory_order_acquire)) [[unlikely]] {
+            if (next == tail_.load(std::memory_order_acquire)) [[unlikely]]
+            {
                 return false;
             }
 
@@ -54,11 +56,13 @@ namespace holo {
             return true;
         }
 
-        [[nodiscard]] bool try_push(T &&item) noexcept {
+        [[nodiscard]] bool try_push(T &&item) noexcept
+        {
             const std::size_t head = head_.load(std::memory_order_relaxed);
             const std::size_t next = (head + 1U) & k_mask;
 
-            if (next == tail_.load(std::memory_order_acquire)) [[unlikely]] {
+            if (next == tail_.load(std::memory_order_acquire)) [[unlikely]]
+            {
                 return false;
             }
 
@@ -67,10 +71,12 @@ namespace holo {
             return true;
         }
 
-        [[nodiscard]] bool try_pop(T &out) noexcept {
+        [[nodiscard]] bool try_pop(T &out) noexcept
+        {
             const std::size_t tail = tail_.load(std::memory_order_relaxed);
 
-            if (tail == head_.load(std::memory_order_acquire)) [[unlikely]] {
+            if (tail == head_.load(std::memory_order_acquire)) [[unlikely]]
+            {
                 return false;
             }
 
@@ -79,36 +85,44 @@ namespace holo {
             return true;
         }
 
-        void push_blocking(const T &item) noexcept {
-            while (!try_push(item)) [[unlikely]] {
+        void push_blocking(const T &item) noexcept
+        {
+            while (!try_push(item)) [[unlikely]]
+            {
                 __builtin_ia32_pause();
             }
         }
 
-        void push_blocking(T &&item) noexcept {
-            while (!try_push(static_cast<T &&>(item))) [[unlikely]] {
+        void push_blocking(T &&item) noexcept
+        {
+            while (!try_push(static_cast<T &&>(item))) [[unlikely]]
+            {
                 __builtin_ia32_pause();
             }
         }
 
-        void pop_blocking(T &out) noexcept {
-            while (!try_pop(out)) [[unlikely]] {
+        void pop_blocking(T &out) noexcept
+        {
+            while (!try_pop(out)) [[unlikely]]
+            {
                 __builtin_ia32_pause();
             }
         }
 
-        [[nodiscard]] bool empty() const noexcept {
-            return tail_.load(std::memory_order_acquire)
-                   == head_.load(std::memory_order_acquire);
+        [[nodiscard]] bool empty() const noexcept
+        {
+            return tail_.load(std::memory_order_acquire) == head_.load(std::memory_order_acquire);
         }
 
-        [[nodiscard]] std::size_t size_approx() const noexcept {
+        [[nodiscard]] std::size_t size_approx() const noexcept
+        {
             const std::size_t h = head_.load(std::memory_order_relaxed);
             const std::size_t t = tail_.load(std::memory_order_relaxed);
             return (h - t + k_capacity) & k_mask;
         }
 
-        [[nodiscard]] static constexpr std::size_t capacity() noexcept {
+        [[nodiscard]] static constexpr std::size_t capacity() noexcept
+        {
             return k_capacity - 1U;
         }
 
@@ -122,17 +136,13 @@ namespace holo {
         alignas(k_cache_line) T slots_[k_capacity];
     };
 
-    template<RingElement T>
-    class alignas(k_cache_line) DynamicSpscRingBuffer final {
+    template <RingElement T>
+    class alignas(k_cache_line) DynamicSpscRingBuffer final
+    {
     public:
         DynamicSpscRingBuffer(MemoryArena &arena, std::size_t capacity)
-            : capacity_{capacity}
-              , mask_{capacity - 1U}
-              , slots_{arena.alloc_span<T>(capacity)}
-              , head_{0U}
-              , _pad0_{}
-              , tail_{0U}
-              , _pad1_{} {
+            : capacity_{capacity}, mask_{capacity - 1U}, slots_{arena.alloc_span<T>(capacity)}, head_{0U}, _pad0_{}, tail_{0U}, _pad1_{}
+        {
             assert((capacity & mask_) == 0U && "Capacity must be power of two.");
             assert(!slots_.empty() && "Arena allocation failed.");
         }
@@ -145,11 +155,13 @@ namespace holo {
 
         DynamicSpscRingBuffer &operator=(DynamicSpscRingBuffer &&) = delete;
 
-        [[nodiscard]] bool try_push(const T &item) noexcept {
+        [[nodiscard]] bool try_push(const T &item) noexcept
+        {
             const std::size_t head = head_.load(std::memory_order_relaxed);
             const std::size_t next = (head + 1U) & mask_;
 
-            if (next == tail_.load(std::memory_order_acquire)) [[unlikely]] {
+            if (next == tail_.load(std::memory_order_acquire)) [[unlikely]]
+            {
                 return false;
             }
 
@@ -158,10 +170,12 @@ namespace holo {
             return true;
         }
 
-        [[nodiscard]] bool try_pop(T &out) noexcept {
+        [[nodiscard]] bool try_pop(T &out) noexcept
+        {
             const std::size_t tail = tail_.load(std::memory_order_relaxed);
 
-            if (tail == head_.load(std::memory_order_acquire)) [[unlikely]] {
+            if (tail == head_.load(std::memory_order_acquire)) [[unlikely]]
+            {
                 return false;
             }
 
@@ -170,17 +184,25 @@ namespace holo {
             return true;
         }
 
-        void push_blocking(const T &item) noexcept {
-            while (!try_push(item)) [[unlikely]] { __builtin_ia32_pause(); }
+        void push_blocking(const T &item) noexcept
+        {
+            while (!try_push(item)) [[unlikely]]
+            {
+                __builtin_ia32_pause();
+            }
         }
 
-        void pop_blocking(T &out) noexcept {
-            while (!try_pop(out)) [[unlikely]] { __builtin_ia32_pause(); }
+        void pop_blocking(T &out) noexcept
+        {
+            while (!try_pop(out)) [[unlikely]]
+            {
+                __builtin_ia32_pause();
+            }
         }
 
-        [[nodiscard]] bool empty() const noexcept {
-            return tail_.load(std::memory_order_acquire)
-                   == head_.load(std::memory_order_acquire);
+        [[nodiscard]] bool empty() const noexcept
+        {
+            return tail_.load(std::memory_order_acquire) == head_.load(std::memory_order_acquire);
         }
 
         [[nodiscard]] std::size_t capacity() const noexcept { return capacity_ - 1U; }

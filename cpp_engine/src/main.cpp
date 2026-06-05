@@ -20,7 +20,8 @@
 #include <time.h>
 #endif
 
-namespace holo {
+namespace holo
+{
     static constexpr std::size_t k_n_instruments = 64U;
     static constexpr std::size_t k_depth_levels = 16U;
     static constexpr std::size_t k_ring_capacity = 1U << 17U;
@@ -30,50 +31,56 @@ namespace holo {
     static constexpr std::size_t k_histogram_buckets = 64U;
     static constexpr std::uint64_t k_pipeline_run_ns = 5'000'000'000ULL;
 
-    [[nodiscard]] static std::uint64_t now_ns() noexcept {
+    [[nodiscard]] static std::uint64_t now_ns() noexcept
+    {
         struct timespec ts{};
         clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
-        return static_cast<std::uint64_t>(ts.tv_sec) * 1'000'000'000ULL
-               + static_cast<std::uint64_t>(ts.tv_nsec);
+        return static_cast<std::uint64_t>(ts.tv_sec) * 1'000'000'000ULL + static_cast<std::uint64_t>(ts.tv_nsec);
     }
 
-    [[nodiscard]] static std::uint64_t rdtsc() noexcept {
+    [[nodiscard]] static std::uint64_t rdtsc() noexcept
+    {
         std::uint32_t lo, hi;
         __asm__ __volatile__(
             "lfence\n\t"
             "rdtsc\n\t"
-            : "=a"(lo), "=d"(hi) :: "memory");
+            : "=a"(lo), "=d"(hi)::"memory");
         return (static_cast<std::uint64_t>(hi) << 32U) | lo;
     }
 
-    [[nodiscard]] static double estimate_tsc_ghz() noexcept {
+    [[nodiscard]] static double estimate_tsc_ghz() noexcept
+    {
         const std::uint64_t ns0 = now_ns();
         const std::uint64_t tsc0 = rdtsc();
         struct timespec req{0, 50'000'000};
         nanosleep(&req, nullptr);
-        return static_cast<double>(rdtsc() - tsc0)
-               / static_cast<double>(now_ns() - ns0);
+        return static_cast<double>(rdtsc() - tsc0) / static_cast<double>(now_ns() - ns0);
     }
 
-    [[nodiscard]] static std::size_t log2_floor(std::uint64_t v) noexcept {
-        if (v == 0U) return 0U;
+    [[nodiscard]] static std::size_t log2_floor(std::uint64_t v) noexcept
+    {
+        if (v == 0U)
+            return 0U;
         return static_cast<std::size_t>(
             63U - static_cast<unsigned>(__builtin_clzll(v)));
     }
 
 #if defined(__linux__)
-    static void pin_thread(std::thread &t, int core_id) noexcept {
+    static void pin_thread(std::thread &t, int core_id) noexcept
+    {
         cpu_set_t cpuset;
         CPU_ZERO(&cpuset);
         CPU_SET(static_cast<std::size_t>(core_id), &cpuset);
         pthread_setaffinity_np(t.native_handle(), sizeof(cpu_set_t), &cpuset);
     }
 #else
-    static void pin_thread(std::thread &, int) noexcept {
+    static void pin_thread(std::thread &, int) noexcept
+    {
     }
 #endif
 
-    struct alignas(64) LatencyAccum {
+    struct alignas(64) LatencyAccum
+    {
         std::uint64_t count{0U};
         std::uint64_t min_cycles{std::numeric_limits<std::uint64_t>::max()};
         std::uint64_t max_cycles{0U};
@@ -81,10 +88,13 @@ namespace holo {
         double m2{0.0};
         std::array<std::uint64_t, k_histogram_buckets> hist{};
 
-        void record(std::uint64_t cycles) noexcept {
+        void record(std::uint64_t cycles) noexcept
+        {
             ++count;
-            if (cycles < min_cycles) min_cycles = cycles;
-            if (cycles > max_cycles) max_cycles = cycles;
+            if (cycles < min_cycles)
+                min_cycles = cycles;
+            if (cycles > max_cycles)
+                max_cycles = cycles;
             const double delta = static_cast<double>(cycles) - mean;
             mean += delta / static_cast<double>(count);
             m2 += delta * (static_cast<double>(cycles) - mean);
@@ -92,11 +102,14 @@ namespace holo {
                           k_histogram_buckets - 1U)]++;
         }
 
-        [[nodiscard]] double stddev() const noexcept {
-            if (count < 2U) return 0.0;
+        [[nodiscard]] double stddev() const noexcept
+        {
+            if (count < 2U)
+                return 0.0;
             const double var = m2 / static_cast<double>(count - 1U);
             double r = var, p = 0.0;
-            while (r != p) {
+            while (r != p)
+            {
                 p = r;
                 r = 0.5 * (r + var / r);
             }
@@ -104,23 +117,26 @@ namespace holo {
         }
     };
 
-    struct alignas(64) BenchmarkResults {
+    struct alignas(64) BenchmarkResults
+    {
         std::uint64_t producer_duration_ns{0U};
         std::uint64_t consumer_duration_ns{0U};
         std::uint64_t total_messages{0U};
         std::uint64_t dropped_messages{0U};
         LatencyAccum latency{};
 
-        [[nodiscard]] double throughput_mps() const noexcept {
-            if (consumer_duration_ns == 0U) return 0.0;
-            return static_cast<double>(total_messages)
-                   / static_cast<double>(consumer_duration_ns) * 1e9;
+        [[nodiscard]] double throughput_mps() const noexcept
+        {
+            if (consumer_duration_ns == 0U)
+                return 0.0;
+            return static_cast<double>(total_messages) / static_cast<double>(consumer_duration_ns) * 1e9;
         }
     };
 
     using RingT = DynamicSpscRingBuffer<LobUpdate>;
 
-    struct alignas(64) SharedState {
+    struct alignas(64) SharedState
+    {
         std::atomic<bool> consumer_ready{false};
         std::atomic<bool> producer_done{false};
         std::byte _pad[64U - 2U * sizeof(std::atomic<bool>)];
@@ -128,7 +144,8 @@ namespace holo {
 
     static_assert(sizeof(SharedState) == 64U);
 
-    [[nodiscard]] static LobUpdate make_update(std::uint64_t seq) noexcept {
+    [[nodiscard]] static LobUpdate make_update(std::uint64_t seq) noexcept
+    {
         LobUpdate u{};
         u.timestamp_ns = rdtsc();
         u.instrument_id = static_cast<std::uint32_t>(seq % k_n_instruments);
@@ -143,12 +160,15 @@ namespace holo {
     static void producer_fn(
         RingT &ring,
         SharedState &state,
-        BenchmarkResults &results) noexcept {
-        while (!state.consumer_ready.load(std::memory_order_acquire)) {
+        BenchmarkResults &results) noexcept
+    {
+        while (!state.consumer_ready.load(std::memory_order_acquire))
+        {
             __builtin_ia32_pause();
         }
         const std::uint64_t t0 = now_ns();
-        for (std::uint64_t i = 0U; i < k_total_messages; ++i) {
+        for (std::uint64_t i = 0U; i < k_total_messages; ++i)
+        {
             ring.push_blocking(make_update(i));
         }
         results.producer_duration_ns = now_ns() - t0;
@@ -159,39 +179,49 @@ namespace holo {
         RingT &ring,
         LobSoA &lob,
         SharedState &state,
-        BenchmarkResults &results) noexcept {
+        BenchmarkResults &results) noexcept
+    {
         state.consumer_ready.store(true, std::memory_order_release);
         const std::uint64_t t0 = now_ns();
         std::uint64_t consumed = 0U;
         LobUpdate u{};
 
-        while (consumed < k_total_messages) {
-            if (ring.try_pop(u)) [[likely]] {
+        while (consumed < k_total_messages)
+        {
+            if (ring.try_pop(u)) [[likely]]
+            {
                 const std::uint64_t recv = rdtsc();
                 lob.apply(u);
-                if (consumed >= k_warmup_messages) [[likely]] {
+                if (consumed >= k_warmup_messages) [[likely]]
+                {
                     const std::uint64_t lat =
-                            (recv >= u.timestamp_ns) ? (recv - u.timestamp_ns) : 0U;
+                        (recv >= u.timestamp_ns) ? (recv - u.timestamp_ns) : 0U;
                     results.latency.record(lat);
                 }
                 ++consumed;
-            } else {
-                if (state.producer_done.load(std::memory_order_acquire)
-                    && ring.empty()) [[unlikely]] { break; }
+            }
+            else
+            {
+                if (state.producer_done.load(std::memory_order_acquire) && ring.empty()) [[unlikely]]
+                {
+                    break;
+                }
                 __builtin_ia32_pause();
             }
         }
         results.consumer_duration_ns = now_ns() - t0;
         results.total_messages = consumed;
         results.dropped_messages =
-                lob.stats().dropped_updates.load(std::memory_order_relaxed);
+            lob.stats().dropped_updates.load(std::memory_order_relaxed);
     }
 
-    static void print_separator() noexcept {
+    static void print_separator() noexcept
+    {
         std::puts("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     }
 
-    static void print_section(const char *title) noexcept {
+    static void print_section(const char *title) noexcept
+    {
         print_separator();
         std::printf("  %s\n", title);
         print_separator();
@@ -200,7 +230,8 @@ namespace holo {
     static void print_spsc_results(
         const BenchmarkResults &r,
         const LobSoA &lob,
-        double tsc_ghz) noexcept {
+        double tsc_ghz) noexcept
+    {
         const double c2n = 1.0 / tsc_ghz;
         const auto &lat = r.latency;
 
@@ -242,7 +273,8 @@ namespace holo {
                         lob.stats().ask_updates.load(std::memory_order_relaxed)));
         const auto bids = lob.bid_prices(0U);
         const auto asks = lob.ask_prices(0U);
-        if (!bids.empty() && !asks.empty()) {
+        if (!bids.empty() && !asks.empty())
+        {
             std::printf("  Instr[0] bid[0]   : %.4f\n",
                         static_cast<double>(bids[0]));
             std::printf("  Instr[0] ask[0]   : %.4f\n",
@@ -254,8 +286,10 @@ namespace holo {
         }
         print_separator();
         std::puts("  LATENCY HISTOGRAM");
-        for (std::size_t b = 0U; b < k_histogram_buckets; ++b) {
-            if (lat.hist[b] == 0U) continue;
+        for (std::size_t b = 0U; b < k_histogram_buckets; ++b)
+        {
+            if (lat.hist[b] == 0U)
+                continue;
             const std::uint64_t lo_c = (b == 0U) ? 0ULL : (1ULL << (b - 1U));
             const std::uint64_t hi_c = (1ULL << b) - 1ULL;
             std::printf("  [%6llu – %7llu cy | %5.0f – %5.0f ns] : %llu\n",
@@ -268,7 +302,8 @@ namespace holo {
     }
 
     static void print_cuda_results(
-        const cuda::PipelineMetrics &m) noexcept {
+        const cuda::PipelineMetrics &m) noexcept
+    {
         print_section("PHASE II — CUDA TOPOLOGICAL PIPELINE METRICS");
 
         const std::uint64_t n_xfr = m.n_transfers.load(std::memory_order_relaxed);
@@ -286,11 +321,13 @@ namespace holo {
         std::printf("  Arbitrage signals    : %llu\n",
                     static_cast<unsigned long long>(n_sig));
 
-        if (n_xfr > 0U) {
+        if (n_xfr > 0U)
+        {
             std::printf("  Mean transfer time   : %.3f ms\n",
                         static_cast<double>(t_xfr) / static_cast<double>(n_xfr) / 1e6);
         }
-        if (n_decomp > 0U) {
+        if (n_decomp > 0U)
+        {
             std::printf("  Mean Hodge time      : %.3f ms\n",
                         static_cast<double>(t_decomp) / static_cast<double>(n_decomp) / 1e6);
         }
@@ -306,7 +343,8 @@ namespace holo {
     }
 } // namespace holo
 
-int main() {
+int main()
+{
     using namespace holo;
     using namespace holo::cuda;
 
@@ -325,14 +363,16 @@ int main() {
     MemoryArena arena{k_arena_size_bytes};
 
     RingT *const ring_ptr = arena.emplace<RingT>(arena, k_ring_capacity);
-    if (!ring_ptr) {
+    if (!ring_ptr)
+    {
         std::puts("FATAL: ring buffer arena alloc failed.");
         return 1;
     }
 
     LobSoA *const lob_ptr =
-            arena.emplace<LobSoA>(arena, k_n_instruments, k_depth_levels);
-    if (!lob_ptr) {
+        arena.emplace<LobSoA>(arena, k_n_instruments, k_depth_levels);
+    if (!lob_ptr)
+    {
         std::puts("FATAL: LobSoA arena alloc failed.");
         return 1;
     }
@@ -340,7 +380,8 @@ int main() {
     SharedState *const state_ptr = arena.emplace<SharedState>();
     BenchmarkResults *const results_ptr = arena.emplace<BenchmarkResults>();
 
-    if (!state_ptr || !results_ptr) {
+    if (!state_ptr || !results_ptr)
+    {
         std::puts("FATAL: aux arena alloc failed.");
         return 1;
     }
@@ -357,13 +398,11 @@ int main() {
     {
         std::thread producer{
             producer_fn,
-            std::ref(*ring_ptr), std::ref(*state_ptr), std::ref(*results_ptr)
-        };
+            std::ref(*ring_ptr), std::ref(*state_ptr), std::ref(*results_ptr)};
         std::thread consumer{
             consumer_fn,
             std::ref(*ring_ptr), std::ref(*lob_ptr),
-            std::ref(*state_ptr), std::ref(*results_ptr)
-        };
+            std::ref(*state_ptr), std::ref(*results_ptr)};
 
         pin_thread(producer, 0);
         pin_thread(consumer, 2);
@@ -385,15 +424,17 @@ int main() {
         std::atomic<bool> shutdown{false};
 
         std::thread pipeline_thread{
-            [&pipeline, &shutdown]() {
+            [&pipeline, &shutdown]()
+            {
                 pipeline.run_continuous(shutdown);
-            }
-        };
+            }};
 
         std::thread lob_updater{
-            [&lob_ptr, &shutdown]() {
+            [&lob_ptr, &shutdown]()
+            {
                 std::uint64_t seq = 10'000'000ULL;
-                while (!shutdown.load(std::memory_order_relaxed)) {
+                while (!shutdown.load(std::memory_order_relaxed))
+                {
                     LobUpdate u{};
                     u.timestamp_ns = now_ns();
                     u.instrument_id = static_cast<std::uint32_t>(
@@ -401,20 +442,18 @@ int main() {
                     u.depth_level = static_cast<std::uint8_t>(
                         (seq / k_n_instruments) % k_depth_levels);
                     u.side = (seq & 1U) ? Side::Ask : Side::Bid;
-                    u.price = 100.0F
-                              + static_cast<float>((seq * 11U + 17U) % 2000U) * 0.005F;
-                    u.quantity = 1.0F
-                                 + static_cast<float>((seq * 5U + 3U) % 1000U) * 0.05F;
+                    u.price = 100.0F + static_cast<float>((seq * 11U + 17U) % 2000U) * 0.005F;
+                    u.quantity = 1.0F + static_cast<float>((seq * 5U + 3U) % 1000U) * 0.05F;
                     lob_ptr->apply(u);
                     ++seq;
                     struct timespec req{0, 50'000};
                     nanosleep(&req, nullptr);
                 }
-            }
-        };
+            }};
 
         const std::uint64_t t_start = now_ns();
-        while (now_ns() - t_start < k_pipeline_run_ns) {
+        while (now_ns() - t_start < k_pipeline_run_ns)
+        {
             struct timespec req{0, 100'000'000};
             nanosleep(&req, nullptr);
 

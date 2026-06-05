@@ -1,0 +1,13 @@
+[1/7] Building CXX object CMakeFiles/holographic_bench.dir/src/main.cpp.o
+[2/7] Building CUDA object CMakeFiles/holographic_bench.dir/src/lobpcg_solver.cu.o
+[3/7] Building CUDA object CMakeFiles/holographic_bench.dir/src/gpu_lob_mirror.cu.o
+[4/7] Building CUDA object CMakeFiles/holographic_bench.dir/src/hodge_kernel.cu.o
+/home/ubuntu/holographic_market/cpp_engine/src/hodge_kernel.cu(542): warning #550-D: variable "snap" was set but never used
+      const GpuLobSnapshot* snap = nullptr;
+                            ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+[5/7] Building CUDA object CMakeFiles/holographic_bench.dir/src/cuda_pipeline.cu.o
+[6/7] Linking CXX executable CMakeFiles/holographic_bench.dir/cmake_device_link.o
+[7/7] Linking CXX executable bin/holographic_bench

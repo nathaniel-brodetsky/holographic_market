@@ -2,6 +2,7 @@
 #include <cuda_utils.cuh>
 #include <cstdio>
 
-namespace holo::cuda {
+namespace holo::cuda
+{
 
 } // namespace holo::cuda
