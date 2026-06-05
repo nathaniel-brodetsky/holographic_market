@@ -9,7 +9,7 @@ project(
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
-set(CMAKE_CUDA_STANDARD 17)
+set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
@@ -21,6 +21,7 @@ include(CheckCXXSourceRuns)
 add_library(engine_compile_options INTERFACE)
 
 target_compile_options(engine_compile_options INTERFACE
+        $<$<COMPILE_LANGUAGE:CXX>:
         -O3
         -mtune=native
         -funroll-loops
@@ -38,11 +39,22 @@ target_compile_options(engine_compile_options INTERFACE
         -Wnull-dereference
         -Werror
         -pedantic
+        >
+        $<$<COMPILE_LANGUAGE:CUDA>:
+        -O3
+        -Xcompiler=-mtune=native
+        -Xcompiler=-funroll-loops
+        -Xcompiler=-fno-omit-frame-pointer
+        -Xcompiler=-fvisibility=hidden
+        -Xcompiler=-Wall
+        -Xcompiler=-Wextra
+        >
 )
 
 check_cxx_compiler_flag(-flto HAS_LTO)
 if (HAS_LTO)
-    target_compile_options(engine_compile_options INTERFACE -flto)
+    target_compile_options(engine_compile_options INTERFACE
+            $<$<COMPILE_LANGUAGE:CXX>:-flto>)
     target_link_options(engine_compile_options INTERFACE -flto)
 endif ()
 
@@ -60,13 +72,16 @@ unset(CMAKE_REQUIRED_FLAGS)
 
 if (AVX512_RUNS)
     target_compile_options(engine_compile_options INTERFACE
-            -mavx512f -mavx512bw -mavx512dq -mavx512vl)
+            $<$<COMPILE_LANGUAGE:CXX>:-mavx512f -mavx512bw -mavx512dq -mavx512vl>
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-mavx512f,-mavx512bw,-mavx512dq,-mavx512vl>)
     target_compile_definitions(engine_compile_options INTERFACE ARCH_HAS_AVX512=1)
     message(STATUS "AVX-512 : verified at runtime")
 else ()
     check_cxx_compiler_flag(-mavx2 HAS_AVX2)
     if (HAS_AVX2)
-        target_compile_options(engine_compile_options INTERFACE -mavx2 -mfma)
+        target_compile_options(engine_compile_options INTERFACE
+                $<$<COMPILE_LANGUAGE:CXX>:-mavx2 -mfma>
+                $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-mavx2,-mfma>)
         target_compile_definitions(engine_compile_options INTERFACE ARCH_HAS_AVX2=1)
         message(STATUS "AVX-512 : unavailable, AVX2 fallback")
     endif ()

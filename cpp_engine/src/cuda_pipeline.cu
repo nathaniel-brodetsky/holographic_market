@@ -95,7 +95,7 @@ void CudaPipeline::transfer_lob_to_gpu() {
     ev_transfer_done_.record(transfer_stream_);
 
     CUDA_CHECK(cudaStreamWaitEvent(
-        compute_stream_, ev_transfer_done_.event, 0));
+        compute_stream_, ev_transfer_done_.get(), 0));
 
     last_lob_generation_ = gen;
 
@@ -117,7 +117,7 @@ void CudaPipeline::run_spectral_pruning() {
         snap.n_instruments,
         snap.depth,
         laplacian_,
-        handles_.cusparse,
+        handles_.cusparse(),
         compute_stream_);
 
     if (laplacian_.n_rows < 4) return;
@@ -127,14 +127,14 @@ void CudaPipeline::run_spectral_pruning() {
         laplacian_.n_rows,
         k_lobpcg_block_size,
         laplacian_,
-        handles_.cusparse,
+        handles_.cusparse(),
         compute_stream_);
 
     const FiedlerResult fiedler = lobpcg_solve(
         lobpcg_ws_,
         laplacian_,
-        handles_.cublas,
-        handles_.cusparse,
+        handles_.cublas(),
+        handles_.cusparse(),
         compute_stream_);
 
     fiedler_prune_mask(
@@ -154,12 +154,12 @@ void CudaPipeline::run_hodge_decomposition() {
         hodge_ws_,
         laplacian_,
         hodge_ws_.d_prune_mask,
-        handles_.cusparse,
+        handles_.cusparse(),
         compute_stream_);
 
     if (hodge_ws_.n_edges <= 0) return;
 
-    const int blk = k_blk;
+    const int blk = k_hodge_block_dim;
     const int grd = (hodge_ws_.n_edges + blk - 1) / blk;
 
     kernel_build_flow_vector<<<grd, blk, 0, compute_stream_>>>(
@@ -177,8 +177,8 @@ void CudaPipeline::run_hodge_decomposition() {
 
     compute_hodge_decomposition(
         hodge_ws_,
-        handles_.cublas,
-        handles_.cusparse,
+        handles_.cublas(),
+        handles_.cusparse(),
         compute_stream_);
 
     CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
