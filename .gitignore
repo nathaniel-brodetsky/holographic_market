@@ -1,12 +1,119 @@
-# Виртуальные окружения Python
-.venv_holographic/
-venv/
-.env/
-
-# Настройки IDE (CLion, PyCharm, VS Code и т.д.)
-.idea/
-.vscode/
-
-# Папки сборки C++ / CMake
+# ─── Build artefacts ─────────────────────────────────────────────────────────
 build/
 cmake-build-*/
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.out
+*.bin
+*.elf
+
+# ─── CMake generated ─────────────────────────────────────────────────────────
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+install_manifest.txt
+CTestTestfile.cmake
+_CPack_Packages/
+Makefile
+compile_commands.json
+
+# ─── CUDA artefacts ──────────────────────────────────────────────────────────
+*.ptx
+*.cubin
+*.fatbin
+*.nvvm
+*.cubinnote
+*.cudafe1.*
+*.cudafe2.*
+*.cpp[0-9]*.ii
+*.cpp[0-9]*.i
+*.gpu
+*.module_id
+*.reg.c
+*.hash
+*.cpp[0-9]*.sm_*.ptx
+*.ltoir
+*.ltoir_opt
+*.lto_types.h
+
+# ─── NVIDIA profiler / NSight ────────────────────────────────────────────────
+*.nsys-rep
+*.nvprof
+*.nvvp
+*.qdrep
+*.qdstrm
+*.nvtxw
+nsys_*
+ncu_*
+*.sqlite
+
+# ─── Python virtualenvs & bytecode ──────────────────────────────────────────
+.venv_holographic/
+venv/
+.venv/
+.env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+dist/
+*.egg-info/
+.eggs/
+*.egg
+pip-wheel-metadata/
+.mypy_cache/
+.ruff_cache/
+.pytype/
+
+# ─── IDE / editor ────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+.directory
+
+# ─── Logs & runtime outputs ──────────────────────────────────────────────────
+*.log
+*.log.*
+build.log
+*.perf
+perf.data
+perf.data.old
+gmon.out
+callgrind.out.*
+massif.out.*
+cachegrind.out.*
+heaptrack.*
+
+# ─── Debian/CUDA keyring packages ────────────────────────────────────────────
+*.deb
+
+# ─── Large data / market snapshots ──────────────────────────────────────────
+*.bin.gz
+*.bin.zst
+*.parquet
+*.feather
+*.h5
+*.hdf5
+*.arrow
+data/
+snapshots/
+recordings/
+
+# ─── Secrets ─────────────────────────────────────────────────────────────────
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+api_keys.*
+secrets.*

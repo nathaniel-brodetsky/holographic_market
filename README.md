@@ -1,206 +1,244 @@
-# Holographic Market Architecture — CUDA Execution Engine
-## From Topological Theory to Bare-Metal GPU Arbitrage Detection
+# Holographic Market Architecture — v0.3.0
 
 > *"The curvature of a gauge connection is not a metaphor for arbitrage. It is arbitrage."*
 
 ---
 
-## I. Architecture
+## I. What This Is
+
+A bare-metal GPU execution engine for **topological arbitrage detection** in live cryptocurrency limit order books. No indicators. No heuristics. Pure differential geometry computed on an NVIDIA GPU in under one millisecond per cycle.
+
+**Phase I** — zero-allocation C++20 execution kernel, 64-byte aligned SPSC ring buffer.  
+**Phase II** — CUDA topological pipeline: normalized Laplacian → LOBPCG Fiedler vector → Hodge-De Rham decomposition → Yang-Mills curvature extraction.  
+**Phase III** *(current)* — live Binance L2 WebSocket feed handler + cuML DBSCAN on-device regime clustering.
+
+---
+
+## II. Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                    HOLOGRAPHIC ENGINE v0.2                          │
-│                                                                     │
-│  [NIC / Feed Handler]                                               │
-│        │                                                            │
-│        ▼  SPSC Ring Buffer (lock-free, cache-line padded)           │
-│  [CPU Core 0 — Producer]  ──────►  [CPU Core 2 — Consumer]         │
-│                                          │                          │
-│                                    [LobSoA SoA]                     │
-│                                    alignas(64)                      │
-│                                    float32[N×D]                     │
-│                                          │                          │
-│                              cudaHostRegister (pinned)              │
-│                                          │                          │
-│                              cudaMemcpyAsync (DMA, PCIe)            │
-│                                          │                          │
-│  ┌───────────────────────────────────────▼───────────────────────┐  │
-│  │                    GPU PIPELINE                               │  │
-│  │                                                               │  │
-│  │  ① build_normalized_laplacian                                 │  │
-│  │     cuSPARSE CSR  |  kernel_build_cross_impact_edges          │  │
-│  │     L = D^{-1/2}(D-W)D^{-1/2}  ∈ ℝ^{N×N}                   │  │
-│  │                    │                                          │  │
-│  │  ② lobpcg_solve                                               │  │
-│  │     LOBPCG + cuBLAS SpMM  |  k=4 eigenpairs                  │  │
-│  │     Fiedler vector v₂ → 99th percentile prune mask           │  │
-│  │                    │                                          │  │
-│  │  ③ build_incidence_matrices                                   │  │
-│  │     B₁ ∈ ℝ^{|V|×|E|}  signed incidence                       │  │
-│  │     B₂ ∈ ℝ^{|E|×|T|}  triangle incidence                     │  │
-│  │     Δ₁ = B₁ᵀB₁ + B₂B₂ᵀ  ∈ ℝ^{|E|×|E|}                     │  │
-│  │                    │                                          │  │
-│  │  ④ compute_hodge_decomposition                                │  │
-│  │     cuSOLVER Ssyevd  |  full spectral decomp of Δ₁           │  │
-│  │     ω = dα ⊕ δβ ⊕ γ   (Helmholtz-Hodge)                     │  │
-│  │     γ ∈ ker(Δ₁)  →  harmonic arbitrage flow                  │  │
-│  │                    │                                          │  │
-│  │  ⑤ extract_arbitrage_signal                                   │  │
-│  │     S_YM[A] = tr(F∧⋆F) / 4g²                                │  │
-│  │     Active loops: {e : |γₑ| > ε}                             │  │
-│  └───────────────────────────────────────────────────────────────┘  │
-│                              │                                      │
-│                    cudaMemcpyAsync → host                           │
-│                              │                                      │
-│                    [Order Router / Signal Consumer]                 │
-└─────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    HOLOGRAPHIC ENGINE v0.3                              │
+│                                                                         │
+│  [Binance WSS fstream.binance.com]                                      │
+│        │  TLS 1.3 / Beast WebSocket                                     │
+│        │  simdjson zero-copy parse                                      │
+│        ▼                                                                │
+│  [BinanceFeedHandler — boost::asio io_context]                          │
+│        │  try_push → DynamicSpscRingBuffer<LobUpdate>                   │
+│        ▼  (64-byte aligned, lock-free SPSC)                             │
+│  [CPU Core 2 — LOB Consumer]                                            │
+│        │  apply() → LobSoA (SoA, alignas(64), float32[N×D])            │
+│        ▼                                                                │
+│    cudaHostRegister (pinned, zero-copy PCIe DMA)                        │
+│        │                                                                │
+│  ┌─────▼──────────────────────────────────────────────────────────┐    │
+│  │                     GPU PIPELINE (CudaPipeline)                │    │
+│  │                                                                │    │
+│  │  ① build_normalized_laplacian                                  │    │
+│  │     cuSPARSE CSR  ·  kernel_build_cross_impact_edges           │    │
+│  │     L = D^{-½}(D−W)D^{-½}  ∈ ℝ^{N×N}                        │    │
+│  │                    │                                           │    │
+│  │  ② lobpcg_solve                                                │    │
+│  │     LOBPCG + cuBLAS SpMM  ·  k=4 eigenpairs                   │    │
+│  │     Fiedler v₂ → 99th-percentile prune mask                   │    │
+│  │                    │                                           │    │
+│  │  ③ build_incidence_matrices                                    │    │
+│  │     B₁ ∈ ℝ^{|V|×|E|}  ·  B₂ ∈ ℝ^{|E|×|T|}                  │    │
+│  │     Δ₁ = B₁ᵀB₁ + B₂B₂ᵀ  ∈ ℝ^{|E|×|E|}                      │    │
+│  │                    │                                           │    │
+│  │  ④ compute_hodge_decomposition                                 │    │
+│  │     cuSOLVER Ssyevd  ·  full spectral decomp of Δ₁            │    │
+│  │     ω = dα ⊕ δβ ⊕ γ   (Helmholtz-Hodge)                      │    │
+│  │     γ ∈ ker(Δ₁)  →  harmonic arbitrage flow                   │    │
+│  │                    │                                           │    │
+│  │  ⑤ extract_arbitrage_signal                                    │    │
+│  │     S_YM[A] = tr(F∧⋆F) / 4g²                                 │    │
+│  │     d_arb_signal → active loops {e : |γₑ| > ε}               │    │
+│  │                    │                                           │    │
+│  │  ⑥ TopologyClusterer (cuML DBSCAN)                             │    │
+│  │     ML::dbscanFit on d_arb_signal — device only               │    │
+│  │     Regime labels stay on GPU                                  │    │
+│  └────────────────────────────────────────────────────────────────┘    │
+│                              │                                          │
+│                    [Signal Consumer / Order Router]                     │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## II. Mathematical Foundations
+## III. Mathematical Foundations
 
-### II.1 Cross-Impact Tensor as Gauge Connection
+### III.1 Cross-Impact Tensor as Gauge Connection
 
-Define the **cross-impact tensor** $\mathcal{W}_{ij}$ between instruments $i, j \in \{1, \ldots, N\}$:
+$$\mathcal{W}_{ij} = \sum_{d=0}^{D-1} \frac{(\mu_i^d - \mu_j^d)(\mathrm{OIB}_i^d - \mathrm{OIB}_j^d)}{|\mu_i^d - \mu_j^d| + \varepsilon}$$
 
-$$\mathcal{W}_{ij} = \sum_{d=0}^{D-1} \frac{(\mu_i^d - \mu_j^d)(\text{OIB}_i^d - \text{OIB}_j^d)}{|\mu_i^d - \mu_j^d| + \varepsilon}$$
+where $\mu_i^d = \frac{b_i^d + a_i^d}{2}$ is mid-price at depth $d$ and $\mathrm{OIB}_i^d = \frac{Q_i^{\mathrm{bid},d} - Q_i^{\mathrm{ask},d}}{Q_i^{\mathrm{bid},d} + Q_i^{\mathrm{ask},d}}$ is order imbalance.
 
-where $\mu_i^d = \frac{b_i^d + a_i^d}{2}$ is the mid-price at depth $d$ and $\text{OIB}_i^d = \frac{Q_i^{\text{bid},d} - Q_i^{\text{ask},d}}{Q_i^{\text{bid},d} + Q_i^{\text{ask},d}}$ is the **Order Imbalance** at depth $d$.
+Normalized graph Laplacian: $\mathcal{L} = D^{-1/2}(D - W)D^{-1/2} \in \mathbb{R}^{N \times N}$
 
-This is implemented exactly in `kernel_build_flow_vector` — the edge flow $\omega_e$ for edge $e = (i,j)$ is the discrete 1-form version of $\mathcal{W}_{ij}$.
+### III.2 LOBPCG Fiedler Extraction
 
-The **normalized graph Laplacian** of this cross-impact graph:
+$$\mathbf{x}^{(k+1)} = \underset{\mathbf{x} \in \mathrm{span}(\mathbf{X}^{(k)}, \mathbf{W}^{(k)}, \mathbf{P}^{(k)})}{\arg\min}\, \mathcal{R}(\mathbf{x}), \qquad \mathcal{R}(\mathbf{x}) = \frac{\mathbf{x}^T \mathcal{L} \mathbf{x}}{\mathbf{x}^T \mathbf{x}}$$
 
-$$\mathcal{L} = D^{-1/2}(D - W)D^{-1/2} \in \mathbb{R}^{N \times N}$$
+Convergence bound: $\tan\angle(\mathbf{x}^{(k)}, \mathbf{v}_2) \leq \left(\frac{\lambda_3 - \lambda_2}{\lambda_3 + \lambda_2}\right)^k \cdot C_0$
 
-is the discrete curvature operator. Its spectrum encodes the connectivity structure of the entire market.
+### III.3 Hodge-De Rham Decomposition
 
-### II.2 LOBPCG: Locally Optimal Block Preconditioned Conjugate Gradient
-
-The Fiedler vector $\mathbf{v}_2$ (eigenvector corresponding to $\lambda_2(\mathcal{L})$) is computed via **LOBPCG**, the gold-standard algorithm for large sparse eigenproblems in HPC:
-
-$$\mathbf{x}^{(k+1)} = \underset{\mathbf{x} \in \text{span}(\mathbf{X}^{(k)}, \mathbf{W}^{(k)}, \mathbf{P}^{(k)})}{\arg\min} \mathcal{R}(\mathbf{x})$$
-
-where $\mathcal{R}(\mathbf{x}) = \frac{\mathbf{x}^T \mathcal{L} \mathbf{x}}{\mathbf{x}^T \mathbf{x}}$ is the **Rayleigh quotient** and:
-
-- $\mathbf{X}^{(k)}$ — current block of eigenvector approximations
-- $\mathbf{W}^{(k)} = \mathbf{A}\mathbf{X}^{(k)} - \mathbf{X}^{(k)} \boldsymbol{\Lambda}^{(k)}$ — residual (search direction)
-- $\mathbf{P}^{(k)}$ — conjugate direction (momentum term, prevents restart)
-
-**Convergence rate:** LOBPCG achieves:
-
-$$\tan\angle(\mathbf{x}^{(k)}, \mathbf{v}_2) \leq \left(\frac{\lambda_3 - \lambda_2}{\lambda_3 + \lambda_2}\right)^k \cdot C_0$$
-
-superlinear in the **spectral gap** $\lambda_3 - \lambda_2$. For liquid markets, the spectral gap is large, giving convergence in $10$–$30$ iterations versus $\mathcal{O}(N)$ for power iteration.
-
-**GPU implementation:** Each SpMM call (`cusparseSpMM`) achieves peak PCIe bandwidth utilization. The block size $k=4$ allows simultaneous computation of $\lambda_1, \lambda_2, \lambda_3, \lambda_4$ — the first four eigenpairs — giving both the Fiedler vector and the spectral gap in a single solve.
-
-### II.3 Hodge-De Rham Decomposition on the GPU
-
-The **discrete Hodge-1 Laplacian**:
-
-$$\Delta_1 = \underbrace{B_1^T B_1}_{\text{gradient term}} + \underbrace{B_2 B_2^T}_{\text{curl term}} \in \mathbb{R}^{|E| \times |E|}$$
-
-The **Helmholtz-Hodge decomposition** of the order flow 1-form $\omega \in \mathbb{R}^{|E|}$:
-
+$$\Delta_1 = B_1^T B_1 + B_2 B_2^T \in \mathbb{R}^{|E| \times |E|}$$
 $$\omega = \underbrace{d\alpha}_{\text{exact}} \oplus \underbrace{\delta\beta}_{\text{co-exact}} \oplus \underbrace{\gamma}_{\text{harmonic}}$$
 
-Computed on the GPU via full spectral decomposition (`cusolverDnSsyevd`):
+$\gamma \in \ker(\Delta_1)$: first de Rham cohomology class. $\beta_1 = \dim\ker(\Delta_1)$: first Betti number = count of independent arbitrage cycles.
 
-$$\Delta_1 = U \Lambda U^T, \quad \gamma = \underbrace{U_0 U_0^T}_{\text{harmonic projector}} \omega, \quad U_0 = \{u_k : |\lambda_k| < \varepsilon\}$$
+### III.4 Yang-Mills Action
 
-The harmonic component $\gamma \in \ker(\Delta_1)$ satisfies:
+$$S_{YM}[A] = \frac{1}{4g^2} \sum_e F_e^2, \qquad F_e = (\gamma_e - \delta_e) + \gamma_e \cdot \delta_e - \delta_e \cdot \gamma_e$$
 
-$$d\gamma = 0 \quad \text{(closed)} \qquad \delta\gamma = 0 \quad \text{(co-closed)}$$
+$S_{YM} \to 0$: market approaches flat connection (zero arbitrage).  
+$S_{YM} \gg 0$: structural curvature present.
 
-and represents a class in $H^1_{dR}(G, \mathbb{R})$ — the **first de Rham cohomology**. Its dimension $\beta_1 = \dim \ker(\Delta_1)$ is the **first Betti number**: the count of independent arbitrage cycles.
+### III.5 cuML DBSCAN Regime Clustering
 
-### II.4 Yang-Mills Action as Market Efficiency Metric
+On-device DBSCAN over a rolling window of $(S_{YM}, \max|\gamma|, \bar{|\gamma|}, \beta_1)$ feature vectors. Identifies macro-regimes of structural arbitrage without D→H copies on the signal path.
 
-The discrete **Yang-Mills curvature 2-form**:
+$$\text{DBSCAN}(\varepsilon, m_{\min}): \mathbb{R}^{|W| \times 4} \to \{-1, 0, 1, \ldots, K\}^{|W|}$$
 
-$$F_{\mu\nu} = \partial_\mu A_\nu - \partial_\nu A_\mu + [A_\mu, A_\nu]$$
+### III.6 Latency Budget
 
-is approximated on the edge graph by:
-
-$$F_e = (\gamma_e - \delta_e) + \gamma_e \cdot \delta_e - \delta_e \cdot \gamma_e$$
-
-where $\gamma_e$ is the harmonic component (gauge potential) and $\delta_e$ is the co-exact component (field strength). The **Yang-Mills action functional**:
-
-$$S_{YM}[A] = \frac{1}{4g^2} \sum_e F_e^2$$
-
-is computed in `kernel_yang_mills_action` via parallel reduction with shared memory. This scalar is the primary **market efficiency metric**: $S_{YM} \to 0$ means the market is approaching a flat connection (zero arbitrage); $S_{YM} \gg 0$ means structural curvature is present.
-
-**Theorem (Atiyah-Bott, 1983):** The minima of $S_{YM}$ over the space of connections $\mathcal{A}$ are exactly the **Yang-Mills connections** satisfying $D_A \star F_A = 0$. The gradient flow of $S_{YM}$ is the **Yang-Mills heat equation**, the exact analogue of Ricci flow on the connection space.
-
-### II.5 Memory Architecture: Zero-Copy PCIe DMA
-
-The `LobSoA` arrays are registered as **pinned (page-locked) memory** via `cudaHostRegister`. This enables:
-
-1. **DMA transfer** directly from CPU DRAM to GPU VRAM without CPU involvement
-2. **Overlap** of transfer and compute via CUDA streams
-3. **Elimination** of the intermediate `cudaMallocHost` staging buffer
-
-Transfer bandwidth: at $N=64$ instruments, $D=16$ depths, `float32`:
-
-$$\text{LOB size} = 64 \times 16 \times 4 \times 4 = 16{,}384 \text{ bytes} \approx 16 \text{ KB}$$
-
-At PCIe 4.0 × 16 (32 GB/s peak): transfer latency $\approx 0.5\,\mu\text{s}$.
-
-Total GPU pipeline latency budget:
-
-| Stage | Latency |
+| Stage | Target |
 |---|---|
-| PCIe DMA transfer | ~0.5 μs |
+| PCIe DMA (16 KB LOB) | ~0.5 μs |
 | Laplacian assembly (cuSPARSE) | ~50 μs |
 | LOBPCG Fiedler (30 iter) | ~200 μs |
-| Hodge decomp (cuSOLVER) | ~500 μs |
-| Signal extraction + copy | ~10 μs |
-| **Total** | **~760 μs** |
-
-Target for publication: sub-millisecond end-to-end topological arbitrage detection on consumer GPU hardware.
+| Hodge decomp (cuSOLVER Ssyevd) | ~500 μs |
+| Signal extraction | ~10 μs |
+| **Total pipeline** | **< 1 ms** |
+| DBSCAN (async, every 10 cycles) | ~5–20 ms |
 
 ---
 
-## III. Build Instructions
+## IV. Repository Structure
+
+```
+holographic_market/
+├── infra/
+│   └── provision.sh          # Idempotent VM bootstrap (Ubuntu 22.04)
+├── cpp_engine/
+│   ├── CMakeLists.txt
+│   ├── include/
+│   │   ├── lob_core.hpp
+│   │   ├── lockfree_ring_buffer.hpp
+│   │   ├── memory_arena.hpp
+│   │   ├── cuda_pipeline.cuh
+│   │   ├── cuda_utils.cuh
+│   │   ├── gpu_lob_mirror.cuh
+│   │   ├── hodge_kernel.cuh
+│   │   ├── lobpcg_solver.cuh
+│   │   ├── binance_feed.hpp      # Phase III: WebSocket feed handler
+│   │   └── cuml_clustering.cuh   # Phase III: DBSCAN topology clusterer
+│   ├── src/
+│   │   ├── main.cpp
+│   │   ├── cuda_pipeline.cu
+│   │   ├── gpu_lob_mirror.cu
+│   │   ├── hodge_kernel.cu
+│   │   ├── lobpcg_solver.cu
+│   │   └── cuml_clustering.cu    # Phase III
+│   └── third_party/
+│       └── fast_float/           # Vendored by provision.sh
+├── src/
+│   ├── gauge_theory_alpha.py
+│   ├── spectral_pruning.py
+│   └── tensor_compression.py
+├── DEPENDENCIES.md
+├── requirements.txt
+├── run_research.py
+└── README.md
+```
+
+---
+
+## V. Quick Start (VM)
 
 ```bash
-# Install CUDA Toolkit (Fedora)
-sudo dnf install cuda-toolkit cuda-cudart-devel libcublas-devel \
-    libcusparse-devel libcusolver-devel cuda-nvcc
+# 1. Clone
+git clone https://github.com/<org>/holographic_market.git
+cd holographic_market
 
-# Configure (native GPU detection)
-cmake -B build -DCMAKE_BUILD_TYPE=Release -DCUDA_ARCH=native
+# 2. Provision (Ubuntu 22.04, requires root, ~15–20 min first run)
+sudo bash infra/provision.sh
 
-# Build (parallel)
-cmake --build build -j $(nproc)
+# 3. Run the engine (live Binance feed, 30-second window)
+cd cpp_engine
+./build/bin/holographic_bench
 
-# Run
+# 4. Profile
+nsys profile --trace=cuda,nvtx,osrt \
+     -o holographic_profile \
+     ./build/bin/holographic_bench
+nsys-ui holographic_profile.nsys-rep
+```
+
+### Manual build (if provision.sh already ran)
+
+```bash
+cd cpp_engine
+cmake -S . -B build -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_CUDA_ARCHITECTURES=native \
+    -DCMAKE_C_COMPILER=gcc-12 \
+    -DCMAKE_CXX_COMPILER=g++-12 \
+    -DCUML_ROOT=/opt/miniforge3/envs/rapids-holographic
+cmake --build build -j$(nproc)
 ./build/bin/holographic_bench
 ```
 
+### Optional CMake flags
+
+| Flag | Default | Effect |
+|---|---|---|
+| `-DENABLE_ASAN=ON` | OFF | AddressSanitizer + UBSan |
+| `-DENABLE_TSAN=ON` | OFF | ThreadSanitizer |
+| `-DCMAKE_CUDA_ARCHITECTURES=89` | native | Target specific SM (e.g. L4=89, A100=80) |
+
 ---
 
-## IV. Publication Roadmap
+## VI. Dependencies
+
+See [`DEPENDENCIES.md`](DEPENDENCIES.md) for the full manifest.  
+`infra/provision.sh` installs everything automatically on Ubuntu 22.04.
+
+**Summary:**
+
+| Layer | Key deps |
+|---|---|
+| Toolchain | GCC 12, CMake 3.26+, Ninja |
+| CUDA | Toolkit 12.x, cuBLAS, cuSPARSE, cuSOLVER |
+| Networking | Boost 1.83 (Asio + Beast), OpenSSL 3 |
+| Parsing | simdjson 3.9+, fast_float 6.x |
+| ML | RAPIDS cuML 24.x (via conda), RAFT |
+| Python | NumPy, SciPy, JAX, NetworkX, Matplotlib |
+
+---
+
+## VII. Publication Roadmap
 
 **Target venues:**
 
-1. **arXiv:q-fin.CP** — "Topological Arbitrage Detection via Hodge Decomposition of Limit Order Book Flows"
-2. **Journal of Computational Finance** — peer-reviewed, impact factor 1.2
+1. **arXiv:q-fin.CP** — *"Topological Arbitrage Detection via Hodge Decomposition of Limit Order Book Flows"*
+2. **Journal of Computational Finance** — peer-reviewed
 3. **SIAM Journal on Financial Mathematics** — mathematical rigor track
 
-**Required additions for submission:**
+**Remaining requirements for submission:**
 
-1. Real market data validation (Binance WebSocket, $N \geq 100$ instruments)
+1. Real market data validation (Binance WebSocket, $N \geq 100$ instruments) ← **Phase III complete**
 2. Statistical backtest: Sharpe ratio of harmonic-flow-ranked portfolios vs. benchmark
-3. Comparison with classical PCA-based cross-impact models
-4. Formal proof of Theorem 1.1 (Arbitrage-Curvature Correspondence) in discrete setting
-5. Complexity analysis: LOBPCG $\mathcal{O}(k \cdot \text{nnz})$ vs. dense $\mathcal{O}(N^3)$
+3. Comparison with PCA-based cross-impact models
+4. Formal discrete proof of Arbitrage-Curvature Correspondence
+5. Complexity analysis: LOBPCG $\mathcal{O}(k \cdot \mathrm{nnz})$ vs. dense $\mathcal{O}(N^3)$
 
 ---
 
-## V. References
+## VIII. References
 
 1. Atiyah, M.F. & Bott, R. (1983). The Yang-Mills equations over Riemann surfaces. *Phil. Trans. R. Soc. Lond. A* **308**, 523–615.
 2. Knyazev, A.V. (2001). Toward the optimal preconditioned eigensolver: LOBPCG. *SIAM J. Sci. Comput.* **23**(2), 517–541.
