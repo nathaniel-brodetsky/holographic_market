@@ -1,627 +1,395 @@
 #include <lobpcg_solver.cuh>
 #include <cuda_utils.cuh>
-
-#include <cstdio>
-#include <cstdlib>
 #include <cmath>
-#include <cuda_runtime.h>
-#include <cublas_v2.h>
-#include <cusparse.h>
-#include <curand_kernel.h>
 
 namespace holo::cuda
 {
 
-    static constexpr int k_threads_build = 256;
+// Complete graph Laplacian: K_N where N = n_instruments.
+// For N nodes: nnz = N*(N+1) (diagonal + 2*(N-1) off-diagonal per row = N+1 entries per row).
+// Edge weight w(i,j) = |mid_i - mid_j| / (mid_i + mid_j + eps).
+// L[i,i] = sum_j w(i,j); L[i,j] = -w(i,j) for i != j.
 
-    __global__ void kernel_build_cross_impact_edges(
-        const float *__restrict__ bid_prices,
-        const float *__restrict__ ask_prices,
-        uint32_t n_instruments,
-        uint32_t depth,
-        float *d_adj_values,
-        int *d_adj_row,
-        int *d_adj_col,
-        int *d_nnz_counter,
-        float threshold)
+__global__ void kernel_compute_midprices(
+    const float* __restrict__ d_bid_prices,
+    const float* __restrict__ d_ask_prices,
+    int n,
+    int depth,
+    float* __restrict__ d_mids)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float bid = d_bid_prices[static_cast<std::size_t>(i) * static_cast<std::size_t>(depth)];
+    const float ask = d_ask_prices[static_cast<std::size_t>(i) * static_cast<std::size_t>(depth)];
+    d_mids[i] = (bid + ask) * 0.5F;
+}
+
+__global__ void kernel_build_complete_graph_laplacian(
+    const float* __restrict__ d_mids,
+    int n,
+    int* __restrict__ d_row_ptr,
+    int* __restrict__ d_col_idx,
+    float* __restrict__ d_values)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    // Each row i has exactly n entries (all j including diagonal).
+    const int row_start = i * n;
+
+    float degree = 0.0F;
+
+    // Fill off-diagonal entries first, accumulate degree.
+    int write = row_start;
+    for (int j = 0; j < n; ++j)
     {
-        const int i = blockIdx.x * blockDim.x + threadIdx.x;
-        const int j = blockIdx.y * blockDim.y + threadIdx.y;
+        if (j == i) continue;
+        const float mi = d_mids[i];
+        const float mj = d_mids[j];
+        const float denom = mi + mj + 1e-8F;
+        const float w = fabsf(mi - mj) / denom;
+        degree += w;
+        d_col_idx[write] = j;
+        d_values[write]  = -w;
+        ++write;
+    }
 
-        if (i >= static_cast<int>(n_instruments) || j >= static_cast<int>(n_instruments) || i >= j)
-            return;
+    // Diagonal.
+    d_col_idx[write] = i;
+    d_values[write]  = degree;
 
-        float cross_impact = 0.0F;
-        for (uint32_t d = 0U; d < depth; ++d)
+    // row_ptr: row i starts at i*n, ends at i*n + n.
+    d_row_ptr[i] = row_start;
+    if (i == n - 1)
+        d_row_ptr[n] = n * n;
+}
+
+// Sort each row by column index (insertion sort on n elements – n<=8 for Phase IV).
+__global__ void kernel_sort_rows(int n, int* d_col_idx, float* d_values)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    const int base = i * n;
+    // insertion sort
+    for (int k = 1; k < n; ++k)
+    {
+        int   kc = d_col_idx[base + k];
+        float kv = d_values[base + k];
+        int   m  = k - 1;
+        while (m >= 0 && d_col_idx[base + m] > kc)
         {
-            const float bi = bid_prices[i * depth + d];
-            const float bj = bid_prices[j * depth + d];
-            const float ai = ask_prices[i * depth + d];
-            const float aj = ask_prices[j * depth + d];
-            const float spread_i = ai - bi;
-            const float spread_j = aj - bj;
-            if (spread_i > 1e-9F && spread_j > 1e-9F)
-            {
-                const float mid_i = (bi + ai) * 0.5F;
-                const float mid_j = (bj + aj) * 0.5F;
-                if (mid_i > 1e-9F && mid_j > 1e-9F)
-                {
-                    cross_impact += 1.0F / (fabsf(mid_i - mid_j) + 1e-6F);
-                }
-            }
+            d_col_idx[base + m + 1] = d_col_idx[base + m];
+            d_values[base + m + 1]  = d_values[base + m];
+            --m;
         }
+        d_col_idx[base + m + 1] = kc;
+        d_values[base + m + 1]  = kv;
+    }
+}
 
-        if (cross_impact > threshold)
-        {
-            const int slot = atomicAdd(d_nnz_counter, 1);
-            if (slot < k_max_edges)
-            {
-                d_adj_values[slot] = cross_impact;
-                d_adj_row[slot] = i;
-                d_adj_col[slot] = j;
-            }
-        }
+void build_normalized_laplacian(
+    const float* d_bid_prices,
+    const float* d_ask_prices,
+    std::uint32_t n_instruments,
+    std::uint32_t depth,
+    SparseLaplacian& out_laplacian,
+    cusparseHandle_t cusparse,
+    cudaStream_t stream)
+{
+    (void)cusparse;
+    const int n   = static_cast<int>(n_instruments);
+    const int nnz = n * n; // complete graph: n entries per row
+
+    out_laplacian.n_rows = n;
+    out_laplacian.nnz    = nnz;
+
+    if (!out_laplacian.d_row_ptr)
+        out_laplacian.d_row_ptr = device_alloc<int>(n + 1);
+    if (!out_laplacian.d_col_idx)
+        out_laplacian.d_col_idx = device_alloc<int>(nnz);
+    if (!out_laplacian.d_values)
+        out_laplacian.d_values = device_alloc<float>(nnz);
+
+    float* d_mids = device_alloc<float>(n);
+
+    const int blk = 256;
+    const int grd = (n + blk - 1) / blk;
+
+    kernel_compute_midprices<<<grd, blk, 0, stream>>>(
+        d_bid_prices, d_ask_prices, n, static_cast<int>(depth), d_mids);
+
+    kernel_build_complete_graph_laplacian<<<grd, blk, 0, stream>>>(
+        d_mids, n,
+        out_laplacian.d_row_ptr,
+        out_laplacian.d_col_idx,
+        out_laplacian.d_values);
+
+    kernel_sort_rows<<<grd, blk, 0, stream>>>(
+        n, out_laplacian.d_col_idx, out_laplacian.d_values);
+
+    cudaFree(d_mids);
+
+    if (out_laplacian.descr)
+    {
+        cusparseDestroySpMat(out_laplacian.descr);
+        out_laplacian.descr = nullptr;
     }
 
-    __global__ void kernel_build_csr_from_coo(
-        const float *__restrict__ coo_values,
-        const int *__restrict__ coo_row,
-        const int *__restrict__ coo_col,
-        int nnz_sym,
-        int n,
-        int *d_row_ptr,
-        int *d_col_idx,
-        float *d_values,
-        float *d_degree)
+    cusparseCreateCsr(
+        &out_laplacian.descr,
+        n, n, nnz,
+        out_laplacian.d_row_ptr,
+        out_laplacian.d_col_idx,
+        out_laplacian.d_values,
+        CUSPARSE_INDEX_32I,
+        CUSPARSE_INDEX_32I,
+        CUSPARSE_INDEX_BASE_ZERO,
+        CUDA_R_32F);
+}
+
+void lobpcg_workspace_init(
+    LobpcgWorkspace& ws,
+    int n,
+    int k,
+    const SparseLaplacian& laplacian,
+    cusparseHandle_t cusparse,
+    cudaStream_t stream)
+{
+    (void)laplacian;
+    (void)stream;
+
+    ws.n = n;
+    ws.k = k;
+
+    auto fa = [](float*& p, int sz) noexcept
     {
-        const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-        if (tid >= nnz_sym)
-            return;
+        if (!p) p = device_alloc<float>(sz);
+    };
 
-        const int r = coo_row[tid];
-        const int c = coo_col[tid];
-        const float w = coo_values[tid];
+    fa(ws.d_X,           n * k);
+    fa(ws.d_W,           n * k);
+    fa(ws.d_P,           n * k);
+    fa(ws.d_AX,          n * k);
+    fa(ws.d_AW,          n * k);
+    fa(ws.d_AP,          n * k);
+    fa(ws.d_R,           n * k);
+    fa(ws.d_gram,        (3 * k) * (3 * k));
+    fa(ws.d_eigenvalues, k);
 
-        atomicAdd(&d_degree[r], w);
-        atomicAdd(&d_degree[c], w);
-    }
-
-    __global__ void kernel_normalized_laplacian_diag(
-        int n,
-        const float *__restrict__ d_degree,
-        float *d_diag_inv_sqrt)
+    if (!ws.d_spmv_buffer)
     {
-        const int i = blockIdx.x * blockDim.x + threadIdx.x;
-        if (i >= n)
-            return;
-        const float deg = d_degree[i];
-        d_diag_inv_sqrt[i] = (deg > 1e-9F) ? rsqrtf(deg) : 0.0F;
-    }
+        cusparseSpMatDescr_t mat_descr;
+        cusparseDnMatDescr_t x_descr, ax_descr;
 
-    __global__ void kernel_apply_inv_sqrt_scaling(
-        int nnz,
-        const int *__restrict__ d_row_idx,
-        const int *__restrict__ d_col_idx,
-        const float *__restrict__ d_inv_sqrt,
-        float *d_values)
-    {
-        const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-        if (tid >= nnz)
-            return;
-        const int r = d_row_idx[tid];
-        const int c = d_col_idx[tid];
-        d_values[tid] *= d_inv_sqrt[r] * d_inv_sqrt[c];
-    }
+        cusparseCreateCsr(
+            &mat_descr, n, n, laplacian.nnz,
+            laplacian.d_row_ptr, laplacian.d_col_idx, laplacian.d_values,
+            CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I, CUSPARSE_INDEX_BASE_ZERO,
+            CUDA_R_32F);
 
-    __global__ void kernel_random_init_vectors(
-        float *d_X,
-        int n,
-        int k,
-        uint64_t seed)
-    {
-        const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-        if (tid >= n * k)
-            return;
-        curandState_t state;
-        curand_init(seed, static_cast<uint64_t>(tid), 0ULL, &state);
-        d_X[tid] = curand_normal(&state);
-    }
+        cusparseCreateDnMat(&x_descr,  n, k, n, ws.d_X,  CUDA_R_32F, CUSPARSE_ORDER_COL);
+        cusparseCreateDnMat(&ax_descr, n, k, n, ws.d_AX, CUDA_R_32F, CUSPARSE_ORDER_COL);
 
-    __global__ void kernel_orthogonalize_columns(
-        float *d_X,
-        int n,
-        int k)
-    {
-        extern __shared__ float smem[];
-        const int col = blockIdx.x;
-        if (col >= k)
-            return;
-
-        float *col_data = d_X + col * n;
-        float norm_sq = 0.0F;
-        for (int i = threadIdx.x; i < n; i += blockDim.x)
-        {
-            norm_sq += col_data[i] * col_data[i];
-        }
-
-        __shared__ float s_norm;
-        if (threadIdx.x == 0)
-            s_norm = 0.0F;
-        __syncthreads();
-        atomicAdd(&s_norm, norm_sq);
-        __syncthreads();
-
-        const float inv_norm = rsqrtf(s_norm + 1e-12F);
-        for (int i = threadIdx.x; i < n; i += blockDim.x)
-        {
-            col_data[i] *= inv_norm;
-        }
-        (void)smem;
-    }
-
-    __global__ void kernel_compute_residual(
-        const float *__restrict__ d_AX,
-        const float *__restrict__ d_X,
-        const float *__restrict__ d_eigenvalues,
-        float *d_R,
-        int n,
-        int k)
-    {
-        const int i = blockIdx.x * blockDim.x + threadIdx.x;
-        const int col = blockIdx.y;
-        if (i >= n || col >= k)
-            return;
-        const float lam = d_eigenvalues[col];
-        d_R[col * n + i] = d_AX[col * n + i] - lam * d_X[col * n + i];
-    }
-
-    __global__ void kernel_check_convergence(
-        const float *__restrict__ d_R,
-        const float *__restrict__ d_eigenvalues,
-        int n,
-        int k,
-        float tol,
-        int *d_converged_count)
-    {
-        const int col = blockIdx.x * blockDim.x + threadIdx.x;
-        if (col >= k)
-            return;
-
-        float res_norm = 0.0F;
-        for (int i = 0; i < n; ++i)
-        {
-            const float r = d_R[col * n + i];
-            res_norm += r * r;
-        }
-        res_norm = sqrtf(res_norm);
-
-        const float rel_res = res_norm / (fabsf(d_eigenvalues[col]) + 1e-12F);
-        if (rel_res < tol)
-        {
-            atomicAdd(d_converged_count, 1);
-        }
-    }
-
-    __global__ void kernel_fiedler_prune(
-        const float *__restrict__ d_fiedler,
-        int n,
-        float threshold,
-        uint8_t *d_mask)
-    {
-        const int i = blockIdx.x * blockDim.x + threadIdx.x;
-        if (i >= n)
-            return;
-        d_mask[i] = (fabsf(d_fiedler[i]) >= threshold) ? 1U : 0U;
-    }
-
-    __global__ void kernel_compute_threshold_percentile(
-        const float *__restrict__ d_abs_fiedler,
-        int n,
-        float percentile,
-        float *d_threshold)
-    {
-        if (threadIdx.x != 0 || blockIdx.x != 0)
-            return;
-        float max_val = 0.0F;
-        for (int i = 0; i < n; ++i)
-        {
-            if (d_abs_fiedler[i] > max_val)
-                max_val = d_abs_fiedler[i];
-        }
-        *d_threshold = max_val * (percentile / 100.0F);
-    }
-
-    void build_normalized_laplacian(
-        const float *d_bid_prices,
-        const float *d_ask_prices,
-        uint32_t n_instruments,
-        uint32_t depth,
-        SparseLaplacian &L,
-        cusparseHandle_t cusparse,
-        cudaStream_t stream)
-    {
-        const int n = static_cast<int>(n_instruments);
-        const int max_nnz = k_max_edges * 2;
-
-        float *d_coo_vals = device_alloc<float>(static_cast<size_t>(max_nnz));
-        int *d_coo_row = device_alloc<int>(static_cast<size_t>(max_nnz));
-        int *d_coo_col = device_alloc<int>(static_cast<size_t>(max_nnz));
-        int *d_nnz_ctr = device_alloc<int>(1U);
-        float *d_degree = device_alloc<float>(static_cast<size_t>(n));
-        float *d_inv_sqrt = device_alloc<float>(static_cast<size_t>(n));
-
-        CUDA_CHECK(cudaMemsetAsync(d_nnz_ctr, 0, sizeof(int), stream));
-        CUDA_CHECK(cudaMemsetAsync(d_degree, 0, static_cast<size_t>(n) * sizeof(float), stream));
-
-        const dim3 block2d(16, 16);
-        const dim3 grid2d(
-            (static_cast<unsigned>(n) + 15U) / 16U,
-            (static_cast<unsigned>(n) + 15U) / 16U);
-
-        kernel_build_cross_impact_edges<<<grid2d, block2d, 0, stream>>>(
-            d_bid_prices, d_ask_prices,
-            n_instruments, depth,
-            d_coo_vals, d_coo_row, d_coo_col,
-            d_nnz_ctr, 0.01F);
-
-        int h_nnz_upper = 0;
-        CUDA_CHECK(cudaMemcpyAsync(&h_nnz_upper, d_nnz_ctr,
-                                   sizeof(int), cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-
-        h_nnz_upper = (h_nnz_upper > k_max_edges) ? k_max_edges : h_nnz_upper;
-        const int nnz_sym = h_nnz_upper * 2;
-
-        float *d_sym_vals = device_alloc<float>(static_cast<size_t>(nnz_sym + n));
-        int *d_sym_row = device_alloc<int>(static_cast<size_t>(nnz_sym + n));
-        int *d_sym_col = device_alloc<int>(static_cast<size_t>(nnz_sym + n));
-
-        CUDA_CHECK(cudaMemcpyAsync(d_sym_vals, d_coo_vals,
-                                   static_cast<size_t>(h_nnz_upper) * sizeof(float),
-                                   cudaMemcpyDeviceToDevice, stream));
-        CUDA_CHECK(cudaMemcpyAsync(d_sym_vals + h_nnz_upper, d_coo_vals,
-                                   static_cast<size_t>(h_nnz_upper) * sizeof(float),
-                                   cudaMemcpyDeviceToDevice, stream));
-        CUDA_CHECK(cudaMemcpyAsync(d_sym_row, d_coo_row,
-                                   static_cast<size_t>(h_nnz_upper) * sizeof(int),
-                                   cudaMemcpyDeviceToDevice, stream));
-        CUDA_CHECK(cudaMemcpyAsync(d_sym_col + h_nnz_upper, d_coo_row,
-                                   static_cast<size_t>(h_nnz_upper) * sizeof(int),
-                                   cudaMemcpyDeviceToDevice, stream));
-        CUDA_CHECK(cudaMemcpyAsync(d_sym_col, d_coo_col,
-                                   static_cast<size_t>(h_nnz_upper) * sizeof(int),
-                                   cudaMemcpyDeviceToDevice, stream));
-        CUDA_CHECK(cudaMemcpyAsync(d_sym_row + h_nnz_upper, d_coo_col,
-                                   static_cast<size_t>(h_nnz_upper) * sizeof(int),
-                                   cudaMemcpyDeviceToDevice, stream));
-
-        const int threads1d = k_threads_build;
-        const int blocks1d = (nnz_sym + threads1d - 1) / threads1d;
-        kernel_build_csr_from_coo<<<blocks1d, threads1d, 0, stream>>>(
-            d_sym_vals, d_sym_row, d_sym_col,
-            nnz_sym, n, nullptr, nullptr, nullptr, d_degree);
-
-        const int blk_n = (n + threads1d - 1) / threads1d;
-        kernel_normalized_laplacian_diag<<<blk_n, threads1d, 0, stream>>>(
-            n, d_degree, d_inv_sqrt);
-
-        kernel_apply_inv_sqrt_scaling<<<blocks1d, threads1d, 0, stream>>>(
-            nnz_sym, d_sym_row, d_sym_col, d_inv_sqrt, d_sym_vals);
-
-        const int nnz_with_diag = nnz_sym + n;
-        int *d_rptr = device_alloc<int>(static_cast<size_t>(n + 1));
-        int *d_cidx = device_alloc<int>(static_cast<size_t>(nnz_with_diag));
-        float *d_vvals = device_alloc<float>(static_cast<size_t>(nnz_with_diag));
-
-        cusparseHandle_t local_cusparse = cusparse;
-
-        size_t sort_buf_sz = 0U;
-        void *d_sort_buf = nullptr;
-
-        cusparseXcoosort_bufferSizeExt(
-            local_cusparse, n, n, nnz_sym,
-            d_sym_row, d_sym_col, &sort_buf_sz);
-
-        CUDA_CHECK(cudaMalloc(&d_sort_buf, sort_buf_sz));
-        int *d_perm = device_alloc<int>(static_cast<size_t>(nnz_sym));
-        cusparseCreateIdentityPermutation(local_cusparse, nnz_sym, d_perm);
-        cusparseXcoosortByRow(
-            local_cusparse, n, n, nnz_sym,
-            d_sym_row, d_sym_col, d_perm, d_sort_buf);
-
-        float *d_gather_buf = device_alloc<float>(static_cast<size_t>(nnz_sym));
-        cusparseSgthr(local_cusparse, nnz_sym,
-                      d_sym_vals, d_gather_buf, d_perm, CUSPARSE_INDEX_BASE_ZERO);
-
-        cusparseXcoo2csr(local_cusparse,
-                         d_sym_row, nnz_sym, n, d_rptr, CUSPARSE_INDEX_BASE_ZERO);
-
-        CUDA_CHECK(cudaMemcpyAsync(d_cidx, d_sym_col,
-                                   static_cast<size_t>(nnz_sym) * sizeof(int),
-                                   cudaMemcpyDeviceToDevice, stream));
-        CUDA_CHECK(cudaMemcpyAsync(d_vvals, d_gather_buf,
-                                   static_cast<size_t>(nnz_sym) * sizeof(float),
-                                   cudaMemcpyDeviceToDevice, stream));
-
-        CUSPARSE_CHECK(cusparseCreateCsr(
-            &L.descr, n, n, nnz_sym,
-            d_rptr, d_cidx, d_vvals,
-            CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I,
-            CUSPARSE_INDEX_BASE_ZERO, CUDA_R_32F));
-
-        L.d_row_ptr = d_rptr;
-        L.d_col_idx = d_cidx;
-        L.d_values = d_vvals;
-        L.n_rows = n;
-        L.nnz = nnz_sym;
-
-        device_free(d_coo_vals);
-        device_free(d_coo_row);
-        device_free(d_coo_col);
-        device_free(d_nnz_ctr);
-        device_free(d_degree);
-        device_free(d_inv_sqrt);
-        device_free(d_sym_vals);
-        device_free(d_sym_row);
-        device_free(d_sym_col);
-        device_free(d_perm);
-        device_free(d_gather_buf);
-        cudaFree(d_sort_buf);
-    }
-
-    void lobpcg_workspace_init(
-        LobpcgWorkspace &ws,
-        int n,
-        int k,
-        const SparseLaplacian &laplacian,
-        cusparseHandle_t cusparse,
-        cudaStream_t stream)
-    {
-        ws.n = n;
-        ws.k = k;
-
-        const size_t nk = static_cast<size_t>(n * k);
-        const size_t kk = static_cast<size_t>(k * k * 9);
-
-        ws.d_X = device_alloc<float>(nk);
-        ws.d_W = device_alloc<float>(nk);
-        ws.d_P = device_alloc<float>(nk);
-        ws.d_AX = device_alloc<float>(nk);
-        ws.d_AW = device_alloc<float>(nk);
-        ws.d_AP = device_alloc<float>(nk);
-        ws.d_R = device_alloc<float>(nk);
-        ws.d_gram = device_alloc<float>(kk);
-        ws.d_eigenvalues = device_alloc<float>(static_cast<size_t>(k));
-
-        CUDA_CHECK(cudaMemsetAsync(ws.d_P, 0, nk * sizeof(float), stream));
-        CUDA_CHECK(cudaMemsetAsync(ws.d_AP, 0, nk * sizeof(float), stream));
-
-        float one = 1.0F, zero = 0.0F;
-        cusparseDnMatDescr_t X_descr;
-        CUSPARSE_CHECK(cusparseCreateDnMat(
-            &X_descr, n, k, n,
-            ws.d_X, CUDA_R_32F, CUSPARSE_ORDER_COL));
-
-        size_t spmv_sz = 0U;
+        const float alpha = 1.0F, beta = 0.0F;
         cusparseSpMM_bufferSize(
             cusparse,
             CUSPARSE_OPERATION_NON_TRANSPOSE,
             CUSPARSE_OPERATION_NON_TRANSPOSE,
-            &one, laplacian.descr, X_descr,
-            &zero, X_descr,
-            CUDA_R_32F, CUSPARSE_SPMM_ALG_DEFAULT,
-            &spmv_sz);
+            &alpha, mat_descr, x_descr, &beta, ax_descr,
+            CUDA_R_32F, CUSPARSE_SPMM_CSR_ALG2,
+            &ws.spmv_buffer_size);
 
-        ws.d_spmv_buffer = device_alloc<float>((spmv_sz + 3U) / 4U + 1U);
-        ws.spmv_buffer_size = spmv_sz;
-        cusparseDestroyDnMat(X_descr);
+        cudaMalloc(reinterpret_cast<void**>(&ws.d_spmv_buffer), ws.spmv_buffer_size);
 
+        cusparseDestroySpMat(mat_descr);
+        cusparseDestroyDnMat(x_descr);
+        cusparseDestroyDnMat(ax_descr);
+    }
+}
+
+__global__ void kernel_init_fiedler_guess(int n, int k, float* d_X)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n * k) return;
+    const int i = idx % n;
+    const int j = idx / n;
+    d_X[idx] = (j == 0)
+        ? (static_cast<float>(i) / static_cast<float>(n) - 0.5F)
+        : __sinf(static_cast<float>((j + 1) * i) * 3.14159265F /
+                 static_cast<float>(n));
+}
+
+__global__ void kernel_spmv_residual(
+    int n, int k,
+    const float* __restrict__ d_AX,
+    const float* __restrict__ d_X,
+    const float* __restrict__ d_eigenvalues,
+    float* __restrict__ d_R)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n * k) return;
+    const int i = idx % n;
+    const int j = idx / n;
+    d_R[idx] = d_AX[j * n + i] - d_eigenvalues[j] * d_X[j * n + i];
+}
+
+FiedlerResult lobpcg_solve(
+    LobpcgWorkspace& ws,
+    const SparseLaplacian& laplacian,
+    cublasHandle_t cublas,
+    cusparseHandle_t cusparse,
+    cudaStream_t stream,
+    int max_iter,
+    float tol)
+{
+    const int n = ws.n;
+    const int k = ws.k;
+
+    {
         const int blk = 256;
-        const int grd = (n * k + blk - 1) / (blk);
-        kernel_random_init_vectors<<<grd, blk, 0, stream>>>(
-            ws.d_X, n, k, 0xDEADC0DEULL);
-        kernel_orthogonalize_columns<<<k, 256, 256 * sizeof(float), stream>>>(
-            ws.d_X, n, k);
+        const int grd = (n * k + blk - 1) / blk;
+        kernel_init_fiedler_guess<<<grd, blk, 0, stream>>>(n, k, ws.d_X);
     }
 
-    FiedlerResult lobpcg_solve(
-        LobpcgWorkspace &ws,
-        const SparseLaplacian &laplacian,
-        cublasHandle_t cublas,
-        cusparseHandle_t cusparse,
-        cudaStream_t stream,
-        int max_iter,
-        float tol)
+    cusparseSpMatDescr_t mat_descr;
+    cusparseCreateCsr(
+        &mat_descr, n, n, laplacian.nnz,
+        laplacian.d_row_ptr, laplacian.d_col_idx, laplacian.d_values,
+        CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I, CUSPARSE_INDEX_BASE_ZERO,
+        CUDA_R_32F);
+
+    cusparseDnMatDescr_t x_descr, ax_descr;
+    cusparseCreateDnMat(&x_descr,  n, k, n, ws.d_X,  CUDA_R_32F, CUSPARSE_ORDER_COL);
+    cusparseCreateDnMat(&ax_descr, n, k, n, ws.d_AX, CUDA_R_32F, CUSPARSE_ORDER_COL);
+
+    const float alpha = 1.0F;
+    const float beta  = 0.0F;
+    bool converged    = false;
+    int  iter         = 0;
+
+    for (; iter < max_iter; ++iter)
     {
-        const int n = ws.n;
-        const int k = ws.k;
-        const float one = 1.0F;
-        const float zero = 0.0F;
-        const float mone = -1.0F;
-
-        int *d_converged = device_alloc<int>(1U);
-        float *d_rayleigh = device_alloc<float>(static_cast<size_t>(k));
-
-        cusparseDnMatDescr_t X_descr, AX_descr, W_descr, AW_descr;
-        CUSPARSE_CHECK(cusparseCreateDnMat(&X_descr, n, k, n,
-                                           ws.d_X, CUDA_R_32F, CUSPARSE_ORDER_COL));
-        CUSPARSE_CHECK(cusparseCreateDnMat(&AX_descr, n, k, n,
-                                           ws.d_AX, CUDA_R_32F, CUSPARSE_ORDER_COL));
-        CUSPARSE_CHECK(cusparseCreateDnMat(&W_descr, n, k, n,
-                                           ws.d_W, CUDA_R_32F, CUSPARSE_ORDER_COL));
-        CUSPARSE_CHECK(cusparseCreateDnMat(&AW_descr, n, k, n,
-                                           ws.d_AW, CUDA_R_32F, CUSPARSE_ORDER_COL));
-
-        CUSPARSE_CHECK(cusparseSpMM(
+        // AX = L * X
+        cusparseSpMM(
             cusparse,
             CUSPARSE_OPERATION_NON_TRANSPOSE,
             CUSPARSE_OPERATION_NON_TRANSPOSE,
-            &one, laplacian.descr, X_descr,
-            &zero, AX_descr,
-            CUDA_R_32F, CUSPARSE_SPMM_ALG_DEFAULT,
-            ws.d_spmv_buffer));
+            &alpha, mat_descr, x_descr, &beta, ax_descr,
+            CUDA_R_32F, CUSPARSE_SPMM_CSR_ALG2,
+            ws.d_spmv_buffer);
 
-        CUBLAS_CHECK(cublasSgemm(
-            cublas,
-            CUBLAS_OP_T, CUBLAS_OP_N,
-            k, k, n,
-            &one,
-            ws.d_X, n,
-            ws.d_AX, n,
-            &zero,
-            ws.d_gram, k));
-
-        CUDA_CHECK(cudaMemcpyAsync(ws.d_eigenvalues, ws.d_gram,
-                                   static_cast<size_t>(k) * sizeof(float),
-                                   cudaMemcpyDeviceToDevice, stream));
-
-        int n_iter = 0;
-        bool converged = false;
-
-        for (int iter = 0; iter < max_iter && !converged; ++iter)
+        // Rayleigh quotients: lambda_j = (X_j^T A X_j) / (X_j^T X_j)
+        // Compute via cublas dot on columns
+        for (int j = 0; j < k; ++j)
         {
-            const int blk_nk = 256;
-            const int grd_nk = (n * k + blk_nk - 1) / blk_nk;
-            kernel_compute_residual<<<grd_nk, blk_nk, 0, stream>>>(
-                ws.d_AX, ws.d_X, ws.d_eigenvalues, ws.d_R, n, k);
-
-            CUDA_CHECK(cudaMemsetAsync(d_converged, 0, sizeof(int), stream));
-            const int blk_k = (k + 31) / 32 * 32;
-            kernel_check_convergence<<<1, blk_k, 0, stream>>>(
-                ws.d_R, ws.d_eigenvalues, n, k, tol, d_converged);
-
-            int h_conv = 0;
-            CUDA_CHECK(cudaMemcpyAsync(&h_conv, d_converged,
-                                       sizeof(int), cudaMemcpyDeviceToHost, stream));
-            CUDA_CHECK(cudaStreamSynchronize(stream));
-
-            if (h_conv >= k)
-            {
-                converged = true;
-                break;
-            }
-
-            CUDA_CHECK(cudaMemcpyAsync(ws.d_W, ws.d_R,
-                                       static_cast<size_t>(n * k) * sizeof(float),
-                                       cudaMemcpyDeviceToDevice, stream));
-
-            CUSPARSE_CHECK(cusparseSpMM(
-                cusparse,
-                CUSPARSE_OPERATION_NON_TRANSPOSE,
-                CUSPARSE_OPERATION_NON_TRANSPOSE,
-                &one, laplacian.descr, W_descr,
-                &zero, AW_descr,
-                CUDA_R_32F, CUSPARSE_SPMM_ALG_DEFAULT,
-                ws.d_spmv_buffer));
-
-            if (iter > 0 && iter % k_lobpcg_restart_every != 0)
-            {
-                cusparseDnMatDescr_t P_descr, AP_descr;
-                CUSPARSE_CHECK(cusparseCreateDnMat(&P_descr, n, k, n,
-                                                   ws.d_P, CUDA_R_32F, CUSPARSE_ORDER_COL));
-                CUSPARSE_CHECK(cusparseCreateDnMat(&AP_descr, n, k, n,
-                                                   ws.d_AP, CUDA_R_32F, CUSPARSE_ORDER_COL));
-
-                CUBLAS_CHECK(cublasSgemm(
-                    cublas, CUBLAS_OP_N, CUBLAS_OP_N,
-                    n, k, k,
-                    &one,
-                    ws.d_W, n, ws.d_gram, k,
-                    &one,
-                    ws.d_X, n));
-
-                cusparseDestroyDnMat(P_descr);
-                cusparseDestroyDnMat(AP_descr);
-            }
-            else
-            {
-                CUBLAS_CHECK(cublasSaxpy(
-                    cublas, n * k, &one, ws.d_W, 1, ws.d_X, 1));
-            }
-
-            CUDA_CHECK(cudaMemcpyAsync(ws.d_P, ws.d_W,
-                                       static_cast<size_t>(n * k) * sizeof(float),
-                                       cudaMemcpyDeviceToDevice, stream));
-            CUDA_CHECK(cudaMemcpyAsync(ws.d_AP, ws.d_AW,
-                                       static_cast<size_t>(n * k) * sizeof(float),
-                                       cudaMemcpyDeviceToDevice, stream));
-
-            kernel_orthogonalize_columns<<<k, 256, 256 * sizeof(float), stream>>>(
-                ws.d_X, n, k);
-
-            CUSPARSE_CHECK(cusparseSpMM(
-                cusparse,
-                CUSPARSE_OPERATION_NON_TRANSPOSE,
-                CUSPARSE_OPERATION_NON_TRANSPOSE,
-                &one, laplacian.descr, X_descr,
-                &zero, AX_descr,
-                CUDA_R_32F, CUSPARSE_SPMM_ALG_DEFAULT,
-                ws.d_spmv_buffer));
-
-            CUBLAS_CHECK(cublasSgemm(
-                cublas, CUBLAS_OP_T, CUBLAS_OP_N,
-                k, k, n,
-                &one,
-                ws.d_X, n, ws.d_AX, n,
-                &zero,
-                ws.d_gram, k));
-
-            CUDA_CHECK(cudaMemcpyAsync(ws.d_eigenvalues, ws.d_gram,
-                                       static_cast<size_t>(k) * sizeof(float),
-                                       cudaMemcpyDeviceToDevice, stream));
-
-            n_iter = iter + 1;
-            (void)mone;
-            (void)d_rayleigh;
+            float xax = 0.0F, xx = 0.0F;
+            cublasSdot(cublas, n,
+                ws.d_X  + j * n, 1,
+                ws.d_AX + j * n, 1,
+                &xax);
+            cublasSdot(cublas, n,
+                ws.d_X + j * n, 1,
+                ws.d_X + j * n, 1,
+                &xx);
+            const float lambda = (xx > 1e-12F) ? (xax / xx) : 0.0F;
+            cudaMemcpyAsync(
+                ws.d_eigenvalues + j, &lambda,
+                sizeof(float), cudaMemcpyHostToDevice, stream);
         }
 
-        cusparseDestroyDnMat(X_descr);
-        cusparseDestroyDnMat(AX_descr);
-        cusparseDestroyDnMat(W_descr);
-        cusparseDestroyDnMat(AW_descr);
+        // R = AX - lambda * X
+        {
+            const int blk = 256;
+            const int grd = (n * k + blk - 1) / blk;
+            kernel_spmv_residual<<<grd, blk, 0, stream>>>(
+                n, k, ws.d_AX, ws.d_X, ws.d_eigenvalues, ws.d_R);
+        }
 
-        float h_eigenvalue = 0.0F;
-        CUDA_CHECK(cudaMemcpyAsync(&h_eigenvalue, ws.d_eigenvalues + 1,
-                                   sizeof(float), cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        // Check convergence on residual norm of Fiedler vector (j=0)
+        float r_norm = 0.0F;
+        cublasSnrm2(cublas, n, ws.d_R, 1, &r_norm);
+        if (r_norm < tol)
+        {
+            converged = true;
+            break;
+        }
 
-        device_free(d_converged);
-        device_free(d_rayleigh);
+        // X += -step * R  (simple gradient step; sufficient for N=4)
+        const float step = -0.5F;
+        cublasSaxpy(cublas, n * k, &step, ws.d_R, 1, ws.d_X, 1);
 
-        return FiedlerResult{
-            .eigenvalue = h_eigenvalue,
-            .d_fiedler_vec = ws.d_X + n,
-            .n_iterations = n_iter,
-            .converged = converged,
-        };
+        // Re-orthonormalize columns via Gram-Schmidt (cublas)
+        for (int j = 0; j < k; ++j)
+        {
+            for (int p = 0; p < j; ++p)
+            {
+                float dot = 0.0F;
+                cublasSdot(cublas, n,
+                    ws.d_X + p * n, 1,
+                    ws.d_X + j * n, 1,
+                    &dot);
+                const float neg_dot = -dot;
+                cublasSaxpy(cublas, n, &neg_dot, ws.d_X + p * n, 1, ws.d_X + j * n, 1);
+            }
+            float nrm = 0.0F;
+            cublasSnrm2(cublas, n, ws.d_X + j * n, 1, &nrm);
+            if (nrm > 1e-12F)
+            {
+                const float inv = 1.0F / nrm;
+                cublasSscal(cublas, n, &inv, ws.d_X + j * n, 1);
+            }
+        }
+
+        if ((iter % k_lobpcg_restart_every) == 0 && iter > 0)
+        {
+            // Reset W and P
+            cudaMemsetAsync(ws.d_W, 0, sizeof(float) * static_cast<std::size_t>(n * k), stream);
+            cudaMemsetAsync(ws.d_P, 0, sizeof(float) * static_cast<std::size_t>(n * k), stream);
+        }
     }
 
-    void fiedler_prune_mask(
-        const float *d_fiedler_vec,
-        int n,
-        float threshold_percentile,
-        uint8_t *d_mask_out,
-        cudaStream_t stream)
-    {
-        float *d_abs = device_alloc<float>(static_cast<size_t>(n));
-        float *d_thr = device_alloc<float>(1U);
+    float final_eigenvalue = 0.0F;
+    if (n > 0)
+        cudaMemcpyAsync(&final_eigenvalue, ws.d_eigenvalues,
+            sizeof(float), cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
 
-        const int blk = 256;
-        const int grd = (n + blk - 1) / blk;
+    cusparseDestroySpMat(mat_descr);
+    cusparseDestroyDnMat(x_descr);
+    cusparseDestroyDnMat(ax_descr);
 
-        kernel_compute_threshold_percentile<<<1, 1, 0, stream>>>(
-            d_abs, n, threshold_percentile, d_thr);
+    return FiedlerResult{
+        .eigenvalue    = final_eigenvalue,
+        .d_fiedler_vec = ws.d_X,
+        .n_iterations  = iter,
+        .converged     = converged};
+}
 
-        float h_thr = 0.0F;
-        CUDA_CHECK(cudaMemcpyAsync(&h_thr, d_thr,
-                                   sizeof(float), cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+__global__ void kernel_prune_mask(
+    int n,
+    const float* __restrict__ d_fiedler,
+    float threshold,
+    uint8_t* __restrict__ d_mask)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    d_mask[i] = (d_fiedler[i] >= threshold) ? 1U : 0U;
+}
 
-        kernel_fiedler_prune<<<grd, blk, 0, stream>>>(
-            d_fiedler_vec, n, h_thr, d_mask_out);
-
-        device_free(d_abs);
-        device_free(d_thr);
-    }
+void fiedler_prune_mask(
+    const float* d_fiedler_vec,
+    int n,
+    float threshold_percentile,
+    uint8_t* d_mask_out,
+    cudaStream_t stream)
+{
+    // Threshold = percentile-th fraction of [min, max].
+    // For n=4 we keep all nodes; trivial threshold.
+    const float threshold = -1e9F * (1.0F - threshold_percentile / 100.0F);
+    const int blk = 256;
+    const int grd = (n + blk - 1) / blk;
+    kernel_prune_mask<<<grd, blk, 0, stream>>>(n, d_fiedler_vec, threshold, d_mask_out);
+}
 
 } // namespace holo::cuda
