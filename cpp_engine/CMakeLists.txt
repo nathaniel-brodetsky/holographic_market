@@ -113,22 +113,23 @@ target_compile_options(cuda_compile_options INTERFACE
         >
 )
 
-add_executable(holographic_bench
-        src/main.cpp
+# ── Shared CUDA objects ────────────────────────────────────────────────────────
+
+set(HOLO_CUDA_SOURCES
         src/gpu_lob_mirror.cu
         src/lobpcg_solver.cu
         src/hodge_kernel.cu
         src/cuda_pipeline.cu
 )
 
-target_include_directories(holographic_bench PRIVATE
+set(HOLO_INCLUDE_DIRS
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CUDAToolkit_INCLUDE_DIRS}
         ${Boost_INCLUDE_DIRS}
         ${OPENSSL_INCLUDE_DIR}
 )
 
-target_link_libraries(holographic_bench PRIVATE
+set(HOLO_LINK_LIBS
         engine_compile_options
         cuda_compile_options
         Threads::Threads
@@ -144,10 +145,21 @@ target_link_libraries(holographic_bench PRIVATE
         OpenSSL::Crypto
 )
 
-target_compile_definitions(holographic_bench PRIVATE
+set(HOLO_COMPILE_DEFS
         BOOST_ASIO_HAS_CO_AWAIT=1
         BOOST_ASIO_USE_TS_EXECUTOR_AS_DEFAULT=0
 )
+
+# ── holographic_bench ─────────────────────────────────────────────────────────
+
+add_executable(holographic_bench
+        src/main.cpp
+        ${HOLO_CUDA_SOURCES}
+)
+
+target_include_directories(holographic_bench PRIVATE ${HOLO_INCLUDE_DIRS})
+target_link_libraries(holographic_bench PRIVATE ${HOLO_LINK_LIBS})
+target_compile_definitions(holographic_bench PRIVATE ${HOLO_COMPILE_DEFS})
 
 set_target_properties(holographic_bench PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
@@ -156,18 +168,40 @@ set_target_properties(holographic_bench PROPERTIES
         INTERPROCEDURAL_OPTIMIZATION ${HAS_LTO}
 )
 
+# ── holographic_backtest ──────────────────────────────────────────────────────
+
+add_executable(holographic_backtest
+        src/backtest_main.cpp
+        ${HOLO_CUDA_SOURCES}
+)
+
+target_include_directories(holographic_backtest PRIVATE ${HOLO_INCLUDE_DIRS})
+target_link_libraries(holographic_backtest PRIVATE ${HOLO_LINK_LIBS})
+target_compile_definitions(holographic_backtest PRIVATE ${HOLO_COMPILE_DEFS})
+
+set_target_properties(holographic_backtest PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+        CUDA_SEPARABLE_COMPILATION ON
+        CUDA_RESOLVE_DEVICE_SYMBOLS ON
+        INTERPROCEDURAL_OPTIMIZATION ${HAS_LTO}
+)
+
+# ── Sanitizer options (shared) ────────────────────────────────────────────────
+
 option(ENABLE_ASAN "AddressSanitizer" OFF)
 if (ENABLE_ASAN)
-    target_compile_options(holographic_bench PRIVATE
-            -fsanitize=address,undefined)
-    target_link_options(holographic_bench PRIVATE
-            -fsanitize=address,undefined)
+    foreach (tgt holographic_bench holographic_backtest)
+        target_compile_options(${tgt} PRIVATE -fsanitize=address,undefined)
+        target_link_options(${tgt} PRIVATE -fsanitize=address,undefined)
+    endforeach ()
 endif ()
 
 option(ENABLE_TSAN "ThreadSanitizer" OFF)
 if (ENABLE_TSAN)
-    target_compile_options(holographic_bench PRIVATE -fsanitize=thread)
-    target_link_options(holographic_bench PRIVATE -fsanitize=thread)
+    foreach (tgt holographic_bench holographic_backtest)
+        target_compile_options(${tgt} PRIVATE -fsanitize=thread)
+        target_link_options(${tgt} PRIVATE -fsanitize=thread)
+    endforeach ()
 endif ()
 
 message(STATUS "Build type        : ${CMAKE_BUILD_TYPE}")
