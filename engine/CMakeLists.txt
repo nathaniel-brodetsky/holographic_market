@@ -1,11 +1,11 @@
-cmake_minimum_required(VERSION 3.26)
+cmake_minimum_required(VERSION 3.22)
 
 project(holographic_engine VERSION 2.0.0 LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
-set(CMAKE_CUDA_STANDARD 20)
+set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
@@ -46,7 +46,7 @@ target_compile_options(holo_compile_options INTERFACE
         -Xcompiler=-mtune=native,-funroll-loops,-fno-omit-frame-pointer
         -Xcompiler=-fvisibility=hidden,-Wall,-Wextra,-fcoroutines>)
 
-check_cxx_compiler_flag(-flto HAS_LTO)
+set(HAS_LTO OFF)
 if(HAS_LTO)
     target_compile_options(holo_compile_options INTERFACE
         $<$<COMPILE_LANGUAGE:CXX>:-flto>)
@@ -81,7 +81,8 @@ set(CMAKE_CUDA_ARCHITECTURES "89" CACHE STRING "CUDA arch (L4/4070=89, A100=80)"
 add_library(holo_cuda_options INTERFACE)
 target_compile_options(holo_cuda_options INTERFACE
     $<$<COMPILE_LANGUAGE:CUDA>:
-        -O3 --use_fast_math
+        -std=c++20
+        -std=c++20 -O3 --use_fast_math
         --expt-relaxed-constexpr --expt-extended-lambda
         -lineinfo --generate-line-info
         -Xcompiler=-fno-omit-frame-pointer,-fvisibility=hidden

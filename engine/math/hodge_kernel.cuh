@@ -154,7 +154,16 @@ void copy_signal_to_host(
     int                    n_edges,
     cudaStream_t           stream);
 
-    __global__ void kernel_build_flow_vector(         const float *__restrict__ d_bid_prices,         const float *__restrict__ d_ask_prices,         const float *__restrict__ d_bid_qtys,         const float *__restrict__ d_ask_qtys, 
+    __global__ void kernel_build_flow_vector(
+        const float *__restrict__ d_bid_prices,
+        const float *__restrict__ d_ask_prices,
+        const float *__restrict__ d_bid_qtys,
+        const float *__restrict__ d_ask_qtys,
+        const int *__restrict__ d_edge_src,
+        const int *__restrict__ d_edge_dst,
+        int n_edges,
+        std::uint32_t depth,
+        float *d_omega);
 
 } // namespace holo::cuda
 

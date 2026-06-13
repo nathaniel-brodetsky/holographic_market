@@ -75,7 +75,7 @@ namespace detail
 {
     out = 0U;
     while (p < end && *p >= '0' && *p <= '9')
-        out = out * 10ULL + static_cast<std::uint64_t>(*p++ - '0');
+        out = out * 10U + static_cast<std::uint64_t>(*p++ - '0');
     return p;
 }
 

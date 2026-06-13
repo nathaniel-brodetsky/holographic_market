@@ -126,8 +126,8 @@ public:
 
 private:
     // FIX: use spot stream (stream.binance.com:9443) — correct for depth data
-    static constexpr std::string_view k_ws_host = "stream.binance.com";
-    static constexpr std::string_view k_ws_port = "9443";
+    static constexpr std::string_view k_ws_host = "fstream.binance.com";
+    static constexpr std::string_view k_ws_port = "443";
     static constexpr std::size_t k_max_frame_bytes = 65536U;
 
     [[nodiscard]] static std::string build_path()
@@ -147,7 +147,7 @@ private:
         while (!shutdown_.load(std::memory_order_acquire))
         {
             try { ioc_.restart(); connect_and_stream(); }
-            catch (...) { metrics_.reconnects.fetch_add(1U, std::memory_order_relaxed); }
+            catch (const std::exception& e) { std::fprintf(stderr, "\n[Feed Error] %s\n", e.what()); metrics_.reconnects.fetch_add(1U, std::memory_order_relaxed); }
 
             if (!shutdown_.load(std::memory_order_acquire))
             {

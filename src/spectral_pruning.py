@@ -10,9 +10,9 @@ import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 from numpy.typing import NDArray
 
-type NodeIndices = NDArray[np.int64]
-type AdjacencyMatrix = sp.csr_matrix
-type LaplacianMatrix = sp.csr_matrix
+NodeIndices = NDArray[np.int64]
+AdjacencyMatrix = sp.csr_matrix
+LaplacianMatrix = sp.csr_matrix
 
 _PRUNING_TOLERANCE: Final[float] = 1e-7
 _DEFAULT_THREAD_COUNT: Final[int] = 32

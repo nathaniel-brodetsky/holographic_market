@@ -157,15 +157,15 @@ int main(int argc, char** argv)
 
     // ── LOB state ────────────────────────────────────────────────────────────
 
-    static constexpr std::size_t k_n_instruments = k_feed_n_instruments;  // 4
+    static constexpr std::size_t k_n_instruments = 4U;
     static constexpr std::size_t k_depth         = 1U;   // bookTicker = best bid/ask only
 
     LobSoA lob_soa{arena, k_n_instruments, k_depth};
 
     // ── Ring buffer ──────────────────────────────────────────────────────────
 
-    static constexpr std::size_t k_ring_capacity = 131'072U;
-    DynamicSpscRingBuffer<LobUpdate> ring{k_ring_capacity};
+    static constexpr std::size_t k_ring_capacity = 1'048'576U;
+    DynamicSpscRingBuffer<LobUpdate> ring{arena, k_ring_capacity};
 
     // ── CSV replay handler ───────────────────────────────────────────────────
 
@@ -177,7 +177,7 @@ int main(int argc, char** argv)
 
     // ── GPU pipeline ─────────────────────────────────────────────────────────
 
-    CudaPipeline gpu_pipeline{lob_soa, arena, cli.gpu_device};
+    holo::cuda::CudaPipeline gpu_pipeline{lob_soa, arena, cli.gpu_device};
 
     // ── Signal router + PnL tracker ──────────────────────────────────────────
 
@@ -193,73 +193,83 @@ int main(int argc, char** argv)
     replay.start();
     std::puts("[backtest] Replay started. Processing...");
 
-    // ── Consumer loop ─────────────────────────────────────────────────────────
-    // Drain ring → apply to LOB → run GPU every N updates → route signal.
+    // ── Two-thread architecture ───────────────────────────────────────────────
+    
+    std::atomic<std::uint64_t> lob_update_count{0U};
+    std::atomic<bool>          lob_done{false};
 
-    static constexpr std::uint64_t k_gpu_trigger = 256U;  // updates per GPU cycle
-    std::uint64_t update_count = 0U;
-
-    // Dummy edge topology for the router (fully connected on k_n_instruments).
-    // The real topology is built inside the GPU kernel from the LOB cross-impact.
-    // Here we expose it as flat arrays so SignalRouter can resolve src/dst.
-    static constexpr std::size_t k_n_edges =
-        k_n_instruments * (k_n_instruments - 1U);
-
+    static constexpr std::uint64_t k_gpu_trigger = 2048U;
+    static constexpr std::size_t k_n_edges = k_n_instruments * (k_n_instruments - 1U);
     std::vector<int> edge_src; edge_src.reserve(k_n_edges);
     std::vector<int> edge_dst; edge_dst.reserve(k_n_edges);
     for (int i = 0; i < static_cast<int>(k_n_instruments); ++i)
         for (int j = 0; j < static_cast<int>(k_n_instruments); ++j)
             if (i != j) { edge_src.push_back(i); edge_dst.push_back(j); }
 
-    while (true)
-    {
-        LobUpdate u{};
-        if (ring.try_pop(u))
+    // Thread 1: Drain ring buffer into LOB SoA as fast as possible
+    std::thread lob_thread([&]() {
+        std::uint64_t local_count = 0;
+        while (true)
         {
-            lob_soa.apply(u);
-            ++update_count;
+            LobUpdate u{};
+            if (ring.try_pop(u))
+            {
+                lob_soa.apply(u);
+                ++local_count;
+                
+                // Batch atomic updates to prevent cache-line bouncing with GPU thread
+                if (local_count % 128U == 0U)
+                    lob_update_count.store(local_count, std::memory_order_release);
+            }
+            else
+            {
+                if (replay.finished()) break;
+                __builtin_ia32_pause(); // Spin yield
+            }
+        }
+        
+        // Drain any remaining updates
+        LobUpdate u{};
+        while (ring.try_pop(u)) { lob_soa.apply(u); ++local_count; }
+        
+        lob_update_count.store(local_count, std::memory_order_release);
+        lob_done.store(true, std::memory_order_release);
+    });
 
-            // Run GPU pipeline every k_gpu_trigger updates
-            if (update_count % k_gpu_trigger == 0U)
+    // Thread 2: Run GPU Pipeline asynchronously 
+    std::thread gpu_thread([&]() {
+        std::uint64_t next_gpu_target = k_gpu_trigger;
+        while (true)
+        {
+            const std::uint64_t current_count = lob_update_count.load(std::memory_order_acquire);
+            if (current_count >= next_gpu_target)
             {
                 gpu_pipeline.run_once();
-
-                
-
                 const holo::cuda::SignalRecord sig = gpu_pipeline.last_signal();
 
-                // Dummy curl_flow vector (real one lives on GPU device memory).
-                // In a GPU-side consumer this would be d_arb_signal copied back.
-                // For now we synthesise from yang_mills_action so the router fires.
-                std::vector<float> h_curl_flow(k_n_edges,
-                    sig.yang_mills_action / static_cast<float>(k_n_edges));
+                std::vector<float> h_curl_flow(k_n_edges, sig.yang_mills_action / static_cast<float>(k_n_edges));
 
                 const std::size_t n_routed = router.route(
-                    sig,
-                    std::span<const float>{h_curl_flow},
-                    std::span<const int>  {edge_src},
-                    std::span<const int>  {edge_dst},
-                    top_edges);
+                    sig, std::span<const float>{h_curl_flow}, 
+                    std::span<const int>{edge_src}, std::span<const int>{edge_dst}, top_edges);
 
                 for (std::size_t r = 0U; r < n_routed; ++r)
                 {
                     const auto& re = top_edges[r];
-                    const float mid_src = lob_soa.mid_price(re.src_instrument);
-                    const float mid_dst = lob_soa.mid_price(re.dst_instrument);
-                    pnl.record(re, mid_src, mid_dst);
+                    pnl.record(re, lob_soa.mid_price(re.src_instrument), lob_soa.mid_price(re.dst_instrument));
                 }
+                next_gpu_target += k_gpu_trigger;
+            }
+            else
+            {
+                if (lob_done.load(std::memory_order_acquire) && current_count < next_gpu_target) break;
+                __builtin_ia32_pause();
             }
         }
-        else
-        {
-            // Ring empty — check if replay finished
-            if (replay.finished()) break;
+    });
 
-            // Brief yield to avoid spinning on the empty ring
-            struct timespec req{0, 100'000L};  // 0.1 ms
-            nanosleep(&req, nullptr);
-        }
-    }
+    lob_thread.join();
+    gpu_thread.join();
 
     // Drain any remaining updates after replay EOF
     {

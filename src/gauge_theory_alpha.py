@@ -10,10 +10,10 @@ from jax.experimental import sparse as jsparse
 
 jax_config.update("jax_enable_x64", True)
 
-type JAXArray = jax.Array
-type JAXSparse = jsparse.BCOO
-type EdgeIndices = tuple[int, int]
-type FaceIndices = tuple[int, int, int]
+JAXArray = jax.Array
+JAXSparse = jsparse.BCOO
+EdgeIndices = tuple[int, int]
+FaceIndices = tuple[int, int, int]
 
 _TOLERANCE_64: Final[float] = 1e-12
 _ALPHA_LEARNING_RATE: Final[float] = 1e-3

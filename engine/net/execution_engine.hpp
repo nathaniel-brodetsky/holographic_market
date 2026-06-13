@@ -43,9 +43,7 @@ struct alignas(64) PaperPosition
     std::atomic<float>         realized_pnl{0.0F};
     std::atomic<std::uint64_t> n_orders{0U};
 
-    static constexpr std::size_t k_used =
-        3U * sizeof(std::atomic<float>) + sizeof(std::atomic<std::uint64_t>);
-    std::byte _pad[64U - k_used]{};
+
 };
 static_assert(sizeof(PaperPosition) == 64U);
 
@@ -322,6 +320,7 @@ private:
 
     std::atomic<bool>       shutdown_{false};
     boost::asio::io_context ioc_;
+    boost::asio::executor_work_guard<boost::asio::io_context::executor_type> work_{boost::asio::make_work_guard(ioc_)};
     std::thread             worker_;
 
     std::array<PaperPosition, k_feed_n_instruments> positions_{};

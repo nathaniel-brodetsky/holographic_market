@@ -9,9 +9,9 @@ import numpy as np
 import tensornetwork as tn
 from numpy.typing import NDArray
 
-type BondDimensions = list[int]
-type MPSNodes = list[tn.Node]
-type TensorShape = tuple[int, ...]
+BondDimensions = list
+MPSNodes = list[tn.Node]
+TensorShape = tuple[int, ...]
 
 _LOB_FLOAT_DTYPE: Final[np.dtype] = np.dtype(np.float32)
 _THREAD_LOCK: threading.Lock = threading.Lock()
