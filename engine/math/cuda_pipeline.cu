@@ -1,4 +1,5 @@
 #include <math/cuda_pipeline.cuh>
+#include <math/floer_homology.cuh>
 #include <math/cuda_utils.cuh>
 #include <math/hodge_kernel.cuh>
 #include <math/lobpcg_solver.cuh>
@@ -73,6 +74,8 @@ namespace holo::cuda
         CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
 
         sm_count_ = prop.multiProcessorCount;
+
+        floer_ws_.allocate(k_floer_max_criticals);
 
         std::printf(
             "  [GPU] %-30s | SM: %d | VRAM: %.1f GB | "
@@ -224,7 +227,7 @@ namespace holo::cuda
         const uint64_t idx =
             signal_write_idx_.fetch_add(1U, std::memory_order_acq_rel) % k_signal_history_len;
 
-        signal_history_[idx] = SignalRecord{
+        SignalRecord new_rec{
             .timestamp_ns = sig.signal_ts_ns,
             .yang_mills_action = sig.yang_mills_action,
             .n_active_loops = sig.n_active_loops,
@@ -232,11 +235,39 @@ namespace holo::cuda
             .max_curl = max_curl,
             .mean_curl = mean_curl,
         };
+        run_floer_pass(new_rec);
+        signal_history_[idx] = new_rec;
 
         metrics_.n_arbitrage_signals.fetch_add(1U, std::memory_order_relaxed);
         metrics_.last_ym_action.store(sig.yang_mills_action, std::memory_order_relaxed);
         metrics_.last_harmonic_dims.store(
             hodge_ws_.n_harmonic_dims, std::memory_order_relaxed);
+    }
+
+
+    void CudaPipeline::run_floer_pass(SignalRecord &rec)
+    {
+        if (hodge_ws_.n_edges <= 0) return;
+        const FloerRecord floer = run_floer_analysis(
+            floer_ws_,
+            hodge_ws_.d_curl_magnitude,
+            hodge_ws_.d_coexact,
+            hodge_ws_.d_edge_src,
+            hodge_ws_.d_edge_dst,
+            hodge_ws_.n_edges,
+            hodge_ws_.yang_mills_action,
+            compute_stream_);
+        rec.floer_HF0             = floer.rank_HF0;
+        rec.floer_HF1             = floer.rank_HF1;
+        rec.floer_HF2             = floer.rank_HF2;
+        rec.floer_euler           = floer.euler_characteristic;
+        rec.floer_n_instantons    = floer.n_instantons;
+        rec.floer_entry_action    = floer.entry_action;
+        rec.floer_exit_action     = floer.exit_action;
+        rec.floer_instanton_len   = floer.instanton_length;
+        rec.floer_asd_residual    = floer.mean_self_dual_residual;
+        rec.floer_signal          = static_cast<std::uint8_t>(floer.entry_signal);
+        rec.floer_instanton_found = floer.instanton_found;
     }
 
     void CudaPipeline::run_once()

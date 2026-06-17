@@ -9,6 +9,7 @@
 #include <math/cuda_utils.cuh>
 #include <math/lobpcg_solver.cuh>
 #include <math/hodge_kernel.cuh>
+#include <math/floer_homology.cuh>
 #include <core/lob_core.hpp>
 #include <core/memory_arena.hpp>
 
@@ -92,6 +93,17 @@ struct SignalRecord
     float         max_curl{0.0F};
     float         mean_curl{0.0F};
     int           n_edges{0};
+    int           floer_HF0{0};
+    int           floer_HF1{0};
+    int           floer_HF2{0};
+    int           floer_euler{0};
+    int           floer_n_instantons{0};
+    float         floer_entry_action{0.0F};
+    float         floer_exit_action{0.0F};
+    float         floer_instanton_len{0.0F};
+    float         floer_asd_residual{0.0F};
+    std::uint8_t  floer_signal{1U};
+    bool          floer_instanton_found{false};
 };
 
 class CudaPipeline final
@@ -129,6 +141,7 @@ private:
     void run_spectral_pruning();
     void run_hodge_decomposition();
     void record_signal(const ArbitrageSignal &sig);
+    void run_floer_pass(SignalRecord &rec);
 
     holo::core::LobSoA &lob_soa_;
 
@@ -146,6 +159,7 @@ private:
     SparseLaplacian  laplacian_;
     LobpcgWorkspace  lobpcg_ws_;
     HodgeWorkspace   hodge_ws_;
+    FloerWorkspace   floer_ws_;
 
     float *h_harmonic_out_{nullptr};
     float *h_curl_out_{nullptr};

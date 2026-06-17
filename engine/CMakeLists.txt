@@ -108,6 +108,7 @@ add_library(holo_math STATIC
     math/gpu_lob_mirror.cu
     math/lobpcg_solver.cu
     math/hodge_kernel.cu
+    math/floer_homology.cu
     math/cuda_pipeline.cu
 )
 target_include_directories(holo_math PUBLIC ${HOLO_INCLUDE_DIRS})
