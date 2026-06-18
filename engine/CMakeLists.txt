@@ -9,7 +9,6 @@ set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# ── Dependencies ──────────────────────────────────────────────────────────────
 find_package(CUDAToolkit REQUIRED)
 find_package(Threads     REQUIRED)
 find_package(OpenSSL     REQUIRED)
@@ -26,13 +25,11 @@ find_path(CUML_INCLUDE_DIR cuml/cluster/dbscan.hpp
 find_library(CUML_LIB cuml
     HINTS ${CUML_ROOT}/lib /opt/miniforge3/envs/rapids-holographic/lib)
 
-# ── Compile option targets ────────────────────────────────────────────────────
 include(CheckCXXCompilerFlag)
 include(CheckCXXSourceRuns)
 
 add_library(holo_compile_options INTERFACE)
 
-# C++20 coroutines require exceptions — do NOT add -fno-exceptions here
 target_compile_options(holo_compile_options INTERFACE
     $<$<COMPILE_LANGUAGE:CXX>:
         -O3 -mtune=native -funroll-loops
@@ -82,14 +79,12 @@ add_library(holo_cuda_options INTERFACE)
 target_compile_options(holo_cuda_options INTERFACE
     $<$<COMPILE_LANGUAGE:CUDA>:
         -std=c++20
-        -std=c++20 -O3 --use_fast_math
+        -O3 --use_fast_math
         --expt-relaxed-constexpr --expt-extended-lambda
         -lineinfo --generate-line-info
         -Xcompiler=-fno-omit-frame-pointer,-fvisibility=hidden
         -Xptxas=-v -Xptxas=--allow-expensive-optimizations=true>)
 
-# ── Shared include directories ────────────────────────────────────────────────
-# Engine root is the include root so #include <core/...> <math/...> etc. resolve.
 set(HOLO_INCLUDE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CUDAToolkit_INCLUDE_DIRS}
@@ -103,7 +98,7 @@ if(CUML_INCLUDE_DIR)
     list(APPEND HOLO_INCLUDE_DIRS ${CUML_INCLUDE_DIR})
 endif()
 
-# ── Module: holo_math (GPU topology engine) ───────────────────────────────────
+# ── holo_math ─────────────────────────────────────────────────────────────────
 add_library(holo_math STATIC
     math/gpu_lob_mirror.cu
     math/lobpcg_solver.cu
@@ -119,7 +114,7 @@ set_target_properties(holo_math PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     POSITION_INDEPENDENT_CODE ON)
 
-# ── Module: holo_ai (RAPIDS cuML clustering) ─────────────────────────────────
+# ── holo_ai ───────────────────────────────────────────────────────────────────
 add_library(holo_ai STATIC
     ai/cuml_clustering.cu
 )
@@ -135,7 +130,6 @@ set_target_properties(holo_ai PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     POSITION_INDEPENDENT_CODE ON)
 
-# ── Shared link deps for net targets ─────────────────────────────────────────
 set(HOLO_NET_LINK_LIBS
     Boost::system Boost::json
     OpenSSL::SSL OpenSSL::Crypto
@@ -146,45 +140,32 @@ if(SIMDJSON_LIB)
     target_compile_definitions(holo_math PUBLIC HOLO_HAS_SIMDJSON=1)
 endif()
 
-# ── Executable: holographic_live ─────────────────────────────────────────────
+# ── holographic_live ──────────────────────────────────────────────────────────
 add_executable(holographic_live app/main_live.cpp)
 target_include_directories(holographic_live PRIVATE ${HOLO_INCLUDE_DIRS})
 target_link_libraries(holographic_live PRIVATE
-    holo_compile_options
-    holo_math
-    holo_ai
-    ${HOLO_NET_LINK_LIBS}
-)
+    holo_compile_options holo_math holo_ai ${HOLO_NET_LINK_LIBS})
 target_compile_definitions(holographic_live PRIVATE
     BOOST_ASIO_HAS_CO_AWAIT=1
-    BOOST_ASIO_USE_TS_EXECUTOR_AS_DEFAULT=0
-)
+    BOOST_ASIO_USE_TS_EXECUTOR_AS_DEFAULT=0)
 set_target_properties(holographic_live PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
-    INTERPROCEDURAL_OPTIMIZATION ${HAS_LTO}
-)
+    INTERPROCEDURAL_OPTIMIZATION ${HAS_LTO})
 
-# ── Executable: holographic_backtest ─────────────────────────────────────────
+# ── holographic_backtest ──────────────────────────────────────────────────────
 add_executable(holographic_backtest app/main_backtest.cpp)
 target_include_directories(holographic_backtest PRIVATE ${HOLO_INCLUDE_DIRS})
 target_link_libraries(holographic_backtest PRIVATE
-    holo_compile_options
-    holo_math
-    holo_ai
-    ${HOLO_NET_LINK_LIBS}
-)
+    holo_compile_options holo_math holo_ai ${HOLO_NET_LINK_LIBS})
 target_compile_definitions(holographic_backtest PRIVATE
     BOOST_ASIO_HAS_CO_AWAIT=1
-    BOOST_ASIO_USE_TS_EXECUTOR_AS_DEFAULT=0
-)
+    BOOST_ASIO_USE_TS_EXECUTOR_AS_DEFAULT=0)
 set_target_properties(holographic_backtest PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
-    INTERPROCEDURAL_OPTIMIZATION ${HAS_LTO}
-)
+    INTERPROCEDURAL_OPTIMIZATION ${HAS_LTO})
 
-# ── Status ────────────────────────────────────────────────────────────────────
 message(STATUS "")
 message(STATUS "━━━━ HOLOGRAPHIC ENGINE v2.0 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 message(STATUS "Build type        : ${CMAKE_BUILD_TYPE}")
@@ -198,10 +179,10 @@ message(STATUS "simdjson          : ${SIMDJSON_INCLUDE_DIR}")
 message(STATUS "cuML              : ${CUML_INCLUDE_DIR}")
 message(STATUS "")
 message(STATUS "Targets:")
-message(STATUS "  holo_math        — GPU topology engine (STATIC)")
-message(STATUS "  holo_ai          — RAPIDS cuML clustering (STATIC)")
-message(STATUS "  holographic_live — live trading binary")
-message(STATUS "  holographic_backtest — CSV replay binary (Phase VI stub)")
+message(STATUS "  holo_math            — GPU topology engine (STATIC)")
+message(STATUS "  holo_ai              — RAPIDS cuML clustering (STATIC)")
+message(STATUS "  holographic_live     — live trading binary")
+message(STATUS "  holographic_backtest — CSV replay + Floer-gated backtest (Phase VI)")
 message(STATUS "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
 option(ENABLE_ASAN "AddressSanitizer" OFF)
