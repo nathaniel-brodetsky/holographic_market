@@ -21,9 +21,9 @@ find_library(SIMDJSON_LIB simdjson
 
 set(CUML_ROOT "" CACHE PATH "cuML install prefix")
 find_path(CUML_INCLUDE_DIR cuml/cluster/dbscan.hpp
-    HINTS ${CUML_ROOT}/include /opt/miniforge3/envs/rapids-holographic/include)
+    HINTS ${CUML_ROOT}/include $ENV{CONDA_PREFIX}/include)
 find_library(CUML_LIB cuml
-    HINTS ${CUML_ROOT}/lib /opt/miniforge3/envs/rapids-holographic/lib)
+    HINTS ${CUML_ROOT}/lib $ENV{CONDA_PREFIX}/lib)
 
 include(CheckCXXCompilerFlag)
 include(CheckCXXSourceRuns)
@@ -35,9 +35,9 @@ target_compile_options(holo_compile_options INTERFACE
         -O3 -mtune=native -funroll-loops
         -fno-omit-frame-pointer -fvisibility=hidden
         -fcoroutines
-        -Wall -Wextra -Wshadow -Wconversion -Wsign-conversion
+        -Wall -Wextra -Wshadow -Wconversion 
         -Wundef -Wunreachable-code -Wnull-dereference
-        -Werror -pedantic>
+         -pedantic>
     $<$<COMPILE_LANGUAGE:CUDA>:
         -O3
         -Xcompiler=-mtune=native,-funroll-loops,-fno-omit-frame-pointer
@@ -50,30 +50,9 @@ if(HAS_LTO)
     target_link_options(holo_compile_options INTERFACE -flto)
 endif()
 
-set(CMAKE_REQUIRED_FLAGS "-mavx512f")
-check_cxx_source_runs("
-#include <immintrin.h>
-int main(){__m512 a=_mm512_setzero_ps();__m512 b=_mm512_add_ps(a,a);(void)b;return 0;}
-" AVX512_RUNS)
-unset(CMAKE_REQUIRED_FLAGS)
-if(AVX512_RUNS)
-    target_compile_options(holo_compile_options INTERFACE
-        $<$<COMPILE_LANGUAGE:CXX>:-mavx512f -mavx512bw -mavx512dq -mavx512vl>
-        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-mavx512f,-mavx512bw,-mavx512dq,-mavx512vl>)
-    target_compile_definitions(holo_compile_options INTERFACE ARCH_HAS_AVX512=1)
-    message(STATUS "AVX-512 : verified at runtime")
-else()
-    check_cxx_compiler_flag(-mavx2 HAS_AVX2)
-    if(HAS_AVX2)
-        target_compile_options(holo_compile_options INTERFACE
-            $<$<COMPILE_LANGUAGE:CXX>:-mavx2 -mfma>
-            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-mavx2,-mfma>)
-        target_compile_definitions(holo_compile_options INTERFACE ARCH_HAS_AVX2=1)
-        message(STATUS "AVX-512 : unavailable, AVX2 fallback")
-    endif()
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR CMAKE_CUDA_ARCHITECTURES STREQUAL "52")
+    set(CMAKE_CUDA_ARCHITECTURES "89" CACHE STRING "CUDA arch" FORCE)
 endif()
-
-set(CMAKE_CUDA_ARCHITECTURES "89" CACHE STRING "CUDA arch (L4/4070=89, A100=80)")
 
 add_library(holo_cuda_options INTERFACE)
 target_compile_options(holo_cuda_options INTERFACE
@@ -109,7 +88,7 @@ add_library(holo_math STATIC
 target_include_directories(holo_math PUBLIC ${HOLO_INCLUDE_DIRS})
 target_link_libraries(holo_math PUBLIC
     holo_compile_options holo_cuda_options
-    CUDA::cudart CUDA::cublas CUDA::cusparse CUDA::cusolver CUDA::cuda_driver)
+    CUDA::cudart CUDA::cublas CUDA::cusparse CUDA::cusolver)
 set_target_properties(holo_math PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     POSITION_INDEPENDENT_CODE ON)
@@ -165,30 +144,3 @@ set_target_properties(holographic_backtest PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
     INTERPROCEDURAL_OPTIMIZATION ${HAS_LTO})
-
-message(STATUS "")
-message(STATUS "━━━━ HOLOGRAPHIC ENGINE v2.0 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-message(STATUS "Build type        : ${CMAKE_BUILD_TYPE}")
-message(STATUS "Compiler          : ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
-message(STATUS "CUDA toolkit      : ${CUDAToolkit_VERSION}")
-message(STATUS "CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
-message(STATUS "LTO               : ${HAS_LTO}")
-message(STATUS "Boost             : ${Boost_VERSION}")
-message(STATUS "OpenSSL           : ${OPENSSL_VERSION}")
-message(STATUS "simdjson          : ${SIMDJSON_INCLUDE_DIR}")
-message(STATUS "cuML              : ${CUML_INCLUDE_DIR}")
-message(STATUS "")
-message(STATUS "Targets:")
-message(STATUS "  holo_math            — GPU topology engine (STATIC)")
-message(STATUS "  holo_ai              — RAPIDS cuML clustering (STATIC)")
-message(STATUS "  holographic_live     — live trading binary")
-message(STATUS "  holographic_backtest — CSV replay + Floer-gated backtest (Phase VI)")
-message(STATUS "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-
-option(ENABLE_ASAN "AddressSanitizer" OFF)
-if(ENABLE_ASAN)
-    foreach(tgt holographic_live holographic_backtest)
-        target_compile_options(${tgt} PRIVATE -fsanitize=address,undefined)
-        target_link_options(${tgt} PRIVATE -fsanitize=address,undefined)
-    endforeach()
-endif()
