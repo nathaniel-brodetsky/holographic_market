@@ -1,5 +1,5 @@
-#include <math/floer_homology.cuh>
-#include <math/cuda_utils.cuh>
+#include <compute/floer_homology.cuh>
+#include <compute/cuda_utils.cuh>
 
 #include <cstring>
 #include <cstdio>

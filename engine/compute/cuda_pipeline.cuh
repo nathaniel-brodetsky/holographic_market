@@ -6,12 +6,12 @@
 
 #include <cuda_runtime.h>
 
-#include <math/cuda_utils.cuh>
-#include <math/lobpcg_solver.cuh>
-#include <math/hodge_kernel.cuh>
-#include <math/floer_homology.cuh>
-#include <core/lob_core.hpp>
-#include <core/memory_arena.hpp>
+#include <compute/cuda_utils.cuh>
+#include <compute/lobpcg_solver.cuh>
+#include <compute/hodge_kernel.cuh>
+#include <compute/floer_homology.cuh>
+#include <data_feed/lob_core.hpp>
+#include <common/memory_arena.hpp>
 
 namespace holo::cuda
 {

@@ -7,8 +7,8 @@
 #include <cublas_v2.h>
 #include <cusparse.h>
 
-#include <math/cuda_utils.cuh>
-#include <math/lobpcg_solver.cuh>
+#include <compute/cuda_utils.cuh>
+#include <compute/lobpcg_solver.cuh>
 
 namespace holo::cuda
 {

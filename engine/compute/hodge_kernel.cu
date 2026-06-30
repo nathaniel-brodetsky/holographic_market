@@ -1,6 +1,6 @@
-#include <math/gpu_lob_mirror.cuh>
-#include <math/hodge_kernel.cuh>
-#include <math/cuda_utils.cuh>
+#include <compute/gpu_lob_mirror.cuh>
+#include <compute/hodge_kernel.cuh>
+#include <compute/cuda_utils.cuh>
 
 #include <cstdio>
 #include <cmath>

@@ -7,7 +7,7 @@
 #include <cublas_v2.h>
 #include <cusparse.h>
 
-#include <math/cuda_utils.cuh>
+#include <compute/cuda_utils.cuh>
 
 namespace holo::cuda
 {

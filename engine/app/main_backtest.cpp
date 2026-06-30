@@ -1,9 +1,10 @@
-#include <core/memory_arena.hpp>
-#include <core/lockfree_ring_buffer.hpp>
-#include <core/lob_core.hpp>
-#include <math/cuda_pipeline.cuh>
-#include <net/csv_replay.hpp>
-#include <net/signal_router.hpp>
+#include <common/memory_arena.hpp>
+#include <common/lockfree_ring_buffer.hpp>
+#include <common/types.hpp>
+#include <data_feed/lob_core.hpp>
+#include <data_feed/csv_replay.hpp>
+#include <compute/cuda_pipeline.cuh>
+#include <trading/alpha_model.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -55,10 +56,10 @@ struct EwmaPair {
     double mu{0.0};       // EWMA of log-ratio
     double m2{1e-8};      // EWMA of squared deviation (variance proxy)
     bool   warm{false};   // false until first update
-    static constexpr double k_alpha         = 0.02;    // ~50-tick half-life — быстрее реагирует
+    static constexpr double k_alpha         = 0.02;    // ~50-tick half-life
     static constexpr double k_min_sigma     = 1e-5;
     static constexpr float  k_max_gross_bps = 5.0F;
-    // Returns z-score of current log-ratio; updates state.
+
     double update(double log_ratio) noexcept {
         if (!warm) { mu = log_ratio; m2 = 1e-8; warm = true; return 0.0; }
         const double diff = log_ratio - mu;
@@ -118,7 +119,6 @@ struct PnlTracker {
         //    signal_strength from harmonic flow confirms / gates the trade
         const float sigma_bps   = bl.sigma_bps();
         const float z_f         = static_cast<float>(z_score);
-        // Trade direction: fade the z-score (mean reversion), gated by signal
         const float direction   = -std::copysign(1.0F, z_f) * std::copysign(1.0F, signal_strength);
         const float gross_ret   = std::min(
             std::abs(signal_strength) * std::abs(z_f) * sigma_bps,
@@ -213,14 +213,12 @@ int main(int argc, char **argv) {
                             ReplayConfig{cli.mode, cli.throttle_rate, 500U}};
     holo::cuda::CudaPipeline gpu_pipeline{lob_soa, arena, cli.gpu_device};
 
-    SignalRouter             router{4U};
-    PnlTracker               pnl;
-    SignalRouter::TopKBuffer top_edges{};
-
-    std::vector<int> edge_src, edge_dst;
-    for (int i = 0; i < 4; ++i)
-        for (int j = 0; j < 4; ++j)
-            if (i != j) { edge_src.push_back(i); edge_dst.push_back(j); }
+    // AlphaModel replaces the old SignalRouter::route() call — it owns its
+    // own edge topology and top-K selection, so callers no longer need to
+    // build edge_src/edge_dst arrays by hand.
+    AlphaModel             alpha;
+    PnlTracker              pnl;
+    AlphaModel::TopKBuffer  top_edges{};
 
     const auto t_start = std::chrono::steady_clock::now();
     replay.start();
@@ -252,24 +250,15 @@ int main(int argc, char **argv) {
                 gpu_pipeline.run_once();
                 const auto sig = gpu_pipeline.last_signal();
 
-                if (sig.yang_mills_action > 1e-4F) {
-                    std::vector<float> h_curl_flow(12, sig.yang_mills_action / 12.0F);
-                    const std::size_t n_routed = router.route(
-                        sig,
-                        std::span<const float>{h_curl_flow},
-                        std::span<const int>{edge_src},
-                        std::span<const int>{edge_dst},
-                        top_edges);
-
-                    for (std::size_t r = 0U; r < n_routed; ++r) {
-                        const auto &re = top_edges[r];
-                        pnl.record(
-                            re,
-                            lob_soa.mid_price(re.src_instrument),
-                            lob_soa.mid_price(re.dst_instrument),
-                            lob_soa.spread(re.src_instrument),
-                            sig);
-                    }
+                const std::size_t n_routed = alpha.evaluate(sig, lob_soa, top_edges);
+                for (std::size_t r = 0U; r < n_routed; ++r) {
+                    const auto &re = top_edges[r];
+                    pnl.record(
+                        re,
+                        lob_soa.mid_price(re.src_instrument),
+                        lob_soa.mid_price(re.dst_instrument),
+                        lob_soa.spread(re.src_instrument),
+                        sig);
                 }
                 next_gpu_target += 2048U;
             } else {

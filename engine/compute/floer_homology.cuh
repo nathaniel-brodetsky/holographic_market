@@ -1,7 +1,7 @@
 #pragma once
 
 #include <cuda_runtime.h>
-#include <math/cuda_utils.cuh>
+#include <compute/cuda_utils.cuh>
 
 #include <cstdint>
 

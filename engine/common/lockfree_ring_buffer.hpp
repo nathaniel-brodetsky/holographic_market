@@ -6,7 +6,7 @@
 #include <concepts>
 #include <optional>
 #include <type_traits>
-#include <core/memory_arena.hpp>
+#include <common/memory_arena.hpp>
 
 namespace holo::core
 {

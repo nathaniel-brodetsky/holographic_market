@@ -1,5 +1,5 @@
-#include <math/cuda_pipeline.cuh>
-#include <math/cuda_utils.cuh>
+#include <compute/cuda_pipeline.cuh>
+#include <compute/cuda_utils.cuh>
 
 namespace holo::cuda
 {

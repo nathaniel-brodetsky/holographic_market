@@ -1,5 +1,5 @@
-#include <math/lobpcg_solver.cuh>
-#include <math/cuda_utils.cuh>
+#include <compute/lobpcg_solver.cuh>
+#include <compute/cuda_utils.cuh>
 #include <cmath>
 
 namespace holo::cuda

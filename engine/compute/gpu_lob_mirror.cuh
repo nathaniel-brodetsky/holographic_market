@@ -4,9 +4,9 @@
 #include <cstdint>
 #include <atomic>
 #include <cuda_runtime.h>
-#include <math/cuda_utils.cuh>
-#include <core/memory_arena.hpp>
-#include <core/lob_core.hpp>
+#include <compute/cuda_utils.cuh>
+#include <common/memory_arena.hpp>
+#include <data_feed/lob_core.hpp>
 
 namespace holo::cuda
 {

@@ -1,8 +1,8 @@
-#include <math/cuda_pipeline.cuh>
-#include <math/floer_homology.cuh>
-#include <math/cuda_utils.cuh>
-#include <math/hodge_kernel.cuh>
-#include <math/lobpcg_solver.cuh>
+#include <compute/cuda_pipeline.cuh>
+#include <compute/floer_homology.cuh>
+#include <compute/cuda_utils.cuh>
+#include <compute/hodge_kernel.cuh>
+#include <compute/lobpcg_solver.cuh>
 
 #include <cstdio>
 #include <cstring>

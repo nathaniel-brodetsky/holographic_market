@@ -1,7 +1,7 @@
 #pragma once
 
-#include <core/lob_core.hpp>
-#include <core/lockfree_ring_buffer.hpp>
+#include <data_feed/lob_core.hpp>
+#include <common/lockfree_ring_buffer.hpp>
 
 #include <atomic>
 #include <cstddef>
@@ -15,7 +15,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-namespace holo::net
+namespace holo
 {
 
 enum class ReplayMode : std::uint8_t { Fastest, Realtime, Throttled };
@@ -254,6 +254,6 @@ private:
     ReplayMetrics     metrics_;
 };
 
-} // namespace holo::net
+} // namespace holo
 
-namespace holo { using namespace holo::net; }
+namespace holo { using namespace holo; }

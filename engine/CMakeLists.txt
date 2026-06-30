@@ -35,7 +35,7 @@ target_compile_options(holo_compile_options INTERFACE
         -O3 -mtune=native -funroll-loops
         -fno-omit-frame-pointer -fvisibility=hidden
         -fcoroutines
-        -Wall -Wextra -Wshadow -Wconversion 
+        -Wall -Wextra -Wshadow -Wconversion
         -Wundef -Wunreachable-code -Wnull-dereference
          -pedantic>
     $<$<COMPILE_LANGUAGE:CUDA>:
@@ -64,6 +64,8 @@ target_compile_options(holo_cuda_options INTERFACE
         -Xcompiler=-fno-omit-frame-pointer,-fvisibility=hidden
         -Xptxas=-v -Xptxas=--allow-expensive-optimizations=true>)
 
+# NOTE: include root is engine/ itself, so headers are referenced as
+# <common/...>, <data_feed/...>, <compute/...>, <compute/ai/...>, <trading/...>, etc.
 set(HOLO_INCLUDE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CUDAToolkit_INCLUDE_DIRS}
@@ -77,25 +79,25 @@ if(CUML_INCLUDE_DIR)
     list(APPEND HOLO_INCLUDE_DIRS ${CUML_INCLUDE_DIR})
 endif()
 
-# ── holo_math ─────────────────────────────────────────────────────────────────
-add_library(holo_math STATIC
-    math/gpu_lob_mirror.cu
-    math/lobpcg_solver.cu
-    math/hodge_kernel.cu
-    math/floer_homology.cu
-    math/cuda_pipeline.cu
+# ── holo_compute (formerly holo_math) ────────────────────────────────────────
+add_library(holo_compute STATIC
+    compute/gpu_lob_mirror.cu
+    compute/lobpcg_solver.cu
+    compute/hodge_kernel.cu
+    compute/floer_homology.cu
+    compute/cuda_pipeline.cu
 )
-target_include_directories(holo_math PUBLIC ${HOLO_INCLUDE_DIRS})
-target_link_libraries(holo_math PUBLIC
+target_include_directories(holo_compute PUBLIC ${HOLO_INCLUDE_DIRS})
+target_link_libraries(holo_compute PUBLIC
     holo_compile_options holo_cuda_options
     CUDA::cudart CUDA::cublas CUDA::cusparse CUDA::cusolver)
-set_target_properties(holo_math PROPERTIES
+set_target_properties(holo_compute PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     POSITION_INDEPENDENT_CODE ON)
 
 # ── holo_ai ───────────────────────────────────────────────────────────────────
 add_library(holo_ai STATIC
-    ai/cuml_clustering.cu
+    compute/ai/cuml_clustering.cu
 )
 target_include_directories(holo_ai PUBLIC ${HOLO_INCLUDE_DIRS})
 target_link_libraries(holo_ai PUBLIC
@@ -116,14 +118,14 @@ set(HOLO_NET_LINK_LIBS
 )
 if(SIMDJSON_LIB)
     list(APPEND HOLO_NET_LINK_LIBS ${SIMDJSON_LIB})
-    target_compile_definitions(holo_math PUBLIC HOLO_HAS_SIMDJSON=1)
+    target_compile_definitions(holo_compute PUBLIC HOLO_HAS_SIMDJSON=1)
 endif()
 
 # ── holographic_live ──────────────────────────────────────────────────────────
 add_executable(holographic_live app/main_live.cpp)
 target_include_directories(holographic_live PRIVATE ${HOLO_INCLUDE_DIRS})
 target_link_libraries(holographic_live PRIVATE
-    holo_compile_options holo_math holo_ai ${HOLO_NET_LINK_LIBS})
+    holo_compile_options holo_compute holo_ai ${HOLO_NET_LINK_LIBS})
 target_compile_definitions(holographic_live PRIVATE
     BOOST_ASIO_HAS_CO_AWAIT=1
     BOOST_ASIO_USE_TS_EXECUTOR_AS_DEFAULT=0)
@@ -136,7 +138,7 @@ set_target_properties(holographic_live PROPERTIES
 add_executable(holographic_backtest app/main_backtest.cpp)
 target_include_directories(holographic_backtest PRIVATE ${HOLO_INCLUDE_DIRS})
 target_link_libraries(holographic_backtest PRIVATE
-    holo_compile_options holo_math holo_ai ${HOLO_NET_LINK_LIBS})
+    holo_compile_options holo_compute holo_ai ${HOLO_NET_LINK_LIBS})
 target_compile_definitions(holographic_backtest PRIVATE
     BOOST_ASIO_HAS_CO_AWAIT=1
     BOOST_ASIO_USE_TS_EXECUTOR_AS_DEFAULT=0)
