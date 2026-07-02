@@ -2,9 +2,11 @@
 
 #include <cmath>
 #include <cstddef>
+#include <cstdio>
 #include <span>
 #include <algorithm>
 #include <numeric>
+#include <vector>
 
 namespace holo::backtest
 {

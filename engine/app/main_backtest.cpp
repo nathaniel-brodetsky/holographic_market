@@ -288,6 +288,6 @@ int main(int argc, char **argv) {
             std::chrono::steady_clock::now() - t_start).count();
 
     pnl.print_report(elapsed);
-    pnl.flush_csv("../data");
+    pnl.flush_csv("data");
     return 0;
 }

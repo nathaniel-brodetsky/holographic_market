@@ -1,4 +1,13 @@
+# IDE
 .idea/
-data/
+!.idea/codeStyles/
+!.idea/inspectionProfiles/
+
+# Build
+build/
 engine/build/
-miniforge.sh
+cmake-build-*/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
