@@ -42,23 +42,14 @@ struct TickRecord {
     float         spread_bps;
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// EWMA baseline per instrument-pair (i, j): tracks log(P_j / P_i) mean & var.
-// Used to compute z-score dislocation — the ONLY meaningful cross-asset signal.
-//
-// z = (log(P_j/P_i) - mu_ij) / sigma_ij
-//
-// gross_ret_bps = |z| * sigma_ij * 1e4   [expected mean-reversion in bps]
-// capped at k_max_gross_bps to prevent outlier contamination.
-// ─────────────────────────────────────────────────────────────────────────────
 struct EwmaPair {
-    double mu{0.0};       // EWMA of log-ratio
-    double m2{1e-8};      // EWMA of squared deviation (variance proxy)
-    bool   warm{false};   // false until first update
-    static constexpr double k_alpha         = 0.02;    // ~50-tick half-life — быстрее реагирует
+    double mu{0.0};
+    double m2{1e-8};
+    bool   warm{false};
+    static constexpr double k_alpha         = 0.02;
     static constexpr double k_min_sigma     = 1e-5;
     static constexpr float  k_max_gross_bps = 5.0F;
-    // Returns z-score of current log-ratio; updates state.
+
     double update(double log_ratio) noexcept {
         if (!warm) { mu = log_ratio; m2 = 1e-8; warm = true; return 0.0; }
         const double diff = log_ratio - mu;
@@ -85,7 +76,6 @@ struct PnlTracker {
     std::uint64_t           filtered{0U};
     std::uint64_t           prev_signal_ts_ns{0U};
 
-    // Pair baselines: 4×4 grid, index = src*4 + dst
     EwmaPair baselines[16]{};
 
     void record(
@@ -101,38 +91,27 @@ struct PnlTracker {
         const std::size_t dst = static_cast<std::size_t>(edge.dst_instrument);
         if (src >= 4U || dst >= 4U) return;
 
-        // 1. Log-ratio and z-score via EWMA baseline
         const double log_ratio = std::log(static_cast<double>(mid_dst)
                                         / static_cast<double>(mid_src));
         EwmaPair &bl = baselines[src * 4U + dst];
         const double z_score = bl.update(log_ratio);
 
-        // Skip until baseline is warm (first tick just initialises mu)
         if (!bl.warm) return;
 
-        // 2. Signal direction and strength
         const float signal_strength = std::tanh(edge.harmonic_flow);
-
-        // 3. Expected mean-reversion in bps:
-        //    if z >> 0: pair is stretched above mean → expect reversion → short log_ratio
-        //    signal_strength from harmonic flow confirms / gates the trade
         const float sigma_bps   = bl.sigma_bps();
         const float z_f         = static_cast<float>(z_score);
-        // Trade direction: fade the z-score (mean reversion), gated by signal
         const float direction   = -std::copysign(1.0F, z_f) * std::copysign(1.0F, signal_strength);
         const float gross_ret   = std::min(
             std::abs(signal_strength) * std::abs(z_f) * sigma_bps,
             EwmaPair::k_max_gross_bps);
 
-        // 4. Transaction cost
         const float spread_bps = (spread_price / mid_src) * 1e4F;
 
-        // 5. Cost filter
         if (gross_ret <= spread_bps || std::abs(z_f) < 0.5F) {
             ++filtered; return;
         }
 
-        // 6. Net PnL
         const float net_ret = direction * (gross_ret - spread_bps);
 
         sum_ret  += net_ret;
@@ -217,11 +196,6 @@ int main(int argc, char **argv) {
     PnlTracker               pnl;
     SignalRouter::TopKBuffer top_edges{};
 
-    //std::vector<int> edge_src, edge_dst;
-    //for (int i = 0; i < 4; ++i)
-    //    for (int j = 0; j < 4; ++j)
-    //        if (i != j) { edge_src.push_back(i); edge_dst.push_back(j); }
-
     const auto t_start = std::chrono::steady_clock::now();
     replay.start();
     std::puts("[backtest] Processing...");
@@ -254,7 +228,7 @@ int main(int argc, char **argv) {
 
                 if (sig.yang_mills_action > 1e-4F) {
                     const auto topo = gpu_pipeline.last_topology();
-
+                    
                     if (topo.n_edges > 0 && topo.harmonic_flow != nullptr) {
                         const std::size_t n_routed = router.route(
                             sig,
@@ -291,6 +265,6 @@ int main(int argc, char **argv) {
             std::chrono::steady_clock::now() - t_start).count();
 
     pnl.print_report(elapsed);
-    pnl.flush_csv("data");
+    pnl.flush_csv("../data");
     return 0;
 }

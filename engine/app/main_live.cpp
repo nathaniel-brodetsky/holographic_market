@@ -113,6 +113,7 @@ int main()
     using namespace holo;
     using namespace holo::cuda;
 
+    }
     std::puts("\n");
     print_separator();
     std::puts("  HOLOGRAPHIC MARKET ARCHITECTURE  v0.4.0");
@@ -247,6 +248,7 @@ int main()
             }
         }
 
+    }
     std::puts("\n");
     shutdown.store(true, std::memory_order_release);
     pipeline_thread.join();

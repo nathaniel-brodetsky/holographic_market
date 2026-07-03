@@ -35,15 +35,12 @@ namespace holo::net
 static constexpr std::string_view k_binance_futures_host = "testnet.binancefuture.com";
 static constexpr std::string_view k_binance_futures_port = "443";
 
-// FIX: correct pad sizes with static_assert
 struct alignas(64) PaperPosition
 {
     std::atomic<float>         net_qty{0.0F};
     std::atomic<float>         avg_entry_price{0.0F};
     std::atomic<float>         realized_pnl{0.0F};
     std::atomic<std::uint64_t> n_orders{0U};
-
-
 };
 static_assert(sizeof(PaperPosition) == 64U);
 
@@ -83,7 +80,6 @@ namespace detail
     return out;
 }
 
-// FIX: build params for POST body (not URL query string)
 [[nodiscard]] inline std::string build_order_body(
     std::string_view symbol,
     std::string_view side,
@@ -177,8 +173,9 @@ public:
     }
 
 private:
+    // ИСПРАВЛЕНА СИГНАТУРА: const RoutedEdge& вместо просто RoutedEdge
     boost::asio::awaitable<void> place_order_coro(
-        RoutedEdge edge, float mid_src, float mid_dst)
+        const RoutedEdge& edge, float mid_src, float mid_dst)
     {
         if (edge.src_instrument >= k_feed_n_instruments ||
             edge.dst_instrument >= k_feed_n_instruments)
@@ -197,7 +194,6 @@ private:
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::system_clock::now().time_since_epoch()).count());
 
-        // FIX: build_order_body puts params in POST body, not URL
         const std::string body_src = detail::build_order_body(
             k_symbols_upper[edge.src_instrument],
             long_s ? "BUY" : "SELL", qty_src, api_secret_, ts_ms);
@@ -227,7 +223,6 @@ private:
 
         try
         {
-            // FIX: construct ssl_ctx locally — not shared across coroutines
             ssl::context ssl_ctx{ssl::context::tlsv12_client};
             ssl_ctx.set_default_verify_paths();
 
@@ -239,7 +234,6 @@ private:
 
             beast::ssl_stream<beast::tcp_stream> stream{executor, ssl_ctx};
 
-            // FIX: set SNI before handshake
             if (!SSL_set_tlsext_host_name(
                     stream.native_handle(),
                     k_binance_futures_host.data()))
@@ -250,7 +244,6 @@ private:
             co_await stream.async_handshake(
                 ssl::stream_base::client, boost::asio::use_awaitable);
 
-            // FIX: POST body carries the query, URL is clean /fapi/v1/order
             http::request<http::string_body> req{http::verb::post, "/fapi/v1/order", 11};
             req.set(http::field::host,         k_binance_futures_host);
             req.set(http::field::content_type, "application/x-www-form-urlencoded");
