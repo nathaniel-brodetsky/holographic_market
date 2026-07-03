@@ -5,7 +5,6 @@
 #include <net/csv_replay.hpp>
 #include <net/signal_router.hpp>
 
-#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -14,7 +13,6 @@
 #include <fstream>
 #include <span>
 #include <string>
-#include <thread>
 #include <vector>
 
 using namespace holo;
@@ -187,7 +185,7 @@ int main(int argc, char **argv) {
     MemoryArena   arena{cli.arena_mb * 1024UL * 1024UL};
 
     LobSoA lob_soa{arena, 4U, 1U};
-    DynamicSpscRingBuffer<LobUpdate> ring{arena, 1'048'576U};
+    DynamicSpscRingBuffer<LobUpdate> ring{arena, 8'388'608U};
     CsvReplayHandler replay{ring, cli.csv_path,
                             ReplayConfig{cli.mode, cli.throttle_rate, 500U}};
     holo::cuda::CudaPipeline gpu_pipeline{lob_soa, arena, cli.gpu_device};
@@ -200,71 +198,72 @@ int main(int argc, char **argv) {
     replay.start();
     std::puts("[backtest] Processing...");
 
-    std::atomic<std::uint64_t> lob_update_count{0U};
-    std::atomic<bool>          lob_done{false};
+    // Deterministic single-consumer loop: the CSV replay thread (inside
+    // CsvReplayHandler) is the only producer feeding the ring buffer, and
+    // this loop is the only consumer. Every 2048th applied LOB update
+    // triggers exactly one gpu_pipeline.run_once() call, in file order,
+    // regardless of how fast/slow the GPU happens to run on this particular
+    // execution. This removes the previous two-thread race where a slow
+    // GPU pass (e.g. under compute-sanitizer, or just system jitter) caused
+    // whole batches of market updates to be silently skipped, making the
+    // backtest's signal count and win rate non-reproducible run to run.
+    constexpr std::uint64_t k_gpu_batch = 2048U;
 
-    std::thread lob_thread([&]() {
-        std::uint64_t local_count = 0U;
-        LobUpdate u{};
-        while (!replay.finished() || !ring.empty()) {
-            if (ring.try_pop(u)) {
-                lob_soa.apply(u);
-                ++local_count;
-                if (local_count % 128U == 0U)
-                    lob_update_count.store(local_count, std::memory_order_release);
-            } else { __builtin_ia32_pause(); }
-        }
-        lob_update_count.store(local_count, std::memory_order_release);
-        lob_done.store(true, std::memory_order_release);
-    });
+    std::uint64_t local_count = 0U;
+    LobUpdate     u{};
 
-    std::thread gpu_thread([&]() {
-        std::uint64_t next_gpu_target = 2048U;
-        while (true) {
-            const std::uint64_t cc = lob_update_count.load(std::memory_order_acquire);
-            if (cc >= next_gpu_target) {
-                gpu_pipeline.run_once();
-                const auto sig = gpu_pipeline.last_signal();
+    const auto process_signal = [&]() {
+        gpu_pipeline.run_once();
+        const auto sig = gpu_pipeline.last_signal();
 
-                if (sig.yang_mills_action > 1e-4F) {
-                    const auto topo = gpu_pipeline.last_topology();
-                    
-                    if (topo.n_edges > 0 && topo.harmonic_flow != nullptr) {
-                        const std::size_t n_routed = router.route(
-                            sig,
-                            std::span<const float>{topo.harmonic_flow, static_cast<std::size_t>(topo.n_edges)},
-                            std::span<const int>{topo.edge_src,        static_cast<std::size_t>(topo.n_edges)},
-                            std::span<const int>{topo.edge_dst,        static_cast<std::size_t>(topo.n_edges)},
-                            top_edges);
+        if (sig.yang_mills_action > 1e-4F) {
+            const auto topo = gpu_pipeline.last_topology();
 
-                        for (std::size_t r = 0U; r < n_routed; ++r) {
-                            const auto &re = top_edges[r];
-                            pnl.record(
-                                re,
-                                lob_soa.mid_price(re.src_instrument),
-                                lob_soa.mid_price(re.dst_instrument),
-                                lob_soa.spread(re.src_instrument),
-                                sig);
-                        }
-                    }
+            if (topo.n_edges > 0 && topo.harmonic_flow != nullptr) {
+                const std::size_t n_routed = router.route(
+                    sig,
+                    std::span<const float>{topo.harmonic_flow, static_cast<std::size_t>(topo.n_edges)},
+                    std::span<const int>{topo.edge_src,        static_cast<std::size_t>(topo.n_edges)},
+                    std::span<const int>{topo.edge_dst,        static_cast<std::size_t>(topo.n_edges)},
+                    top_edges);
+
+                for (std::size_t r = 0U; r < n_routed; ++r) {
+                    const auto &re = top_edges[r];
+                    pnl.record(
+                        re,
+                        lob_soa.mid_price(re.src_instrument),
+                        lob_soa.mid_price(re.dst_instrument),
+                        lob_soa.spread(re.src_instrument),
+                        sig);
                 }
-                next_gpu_target += 2048U;
-            } else {
-                if (lob_done.load(std::memory_order_acquire) &&
-                    cc < next_gpu_target) break;
-                __builtin_ia32_pause();
             }
         }
-    });
+    };
 
-    lob_thread.join();
-    gpu_thread.join();
+    while (!replay.finished() || !ring.empty()) {
+        if (ring.try_pop(u)) {
+            lob_soa.apply(u);
+            ++local_count;
+            if (local_count % k_gpu_batch == 0U)
+                process_signal();
+        } else {
+            __builtin_ia32_pause();
+        }
+    }
+
+    // Flush the trailing partial batch (< k_gpu_batch updates) instead of
+    // silently dropping it, so the very end of the file is still analyzed.
+    if (local_count % k_gpu_batch != 0U)
+        process_signal();
 
     const double elapsed =
         std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t_start).count();
 
     pnl.print_report(elapsed);
+    const auto &rm = replay.metrics();
+    std::printf("  Rows read        : %llu\n", static_cast<unsigned long long>(rm.rows_read.load()));
+    std::printf("  Updates dropped  : %llu\n", static_cast<unsigned long long>(rm.updates_dropped.load()));
     pnl.flush_csv("../data");
     return 0;
 }

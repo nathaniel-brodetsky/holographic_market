@@ -111,10 +111,8 @@ __global__ void kernel_find_instantons(
     const float asd_residual = fabsf(coexact_src + coexact_dst) /
                                (curl_src + curl_dst + 1e-8F);
     const float path_action  = sqrtf(src->action * dst->action + 1e-10F);
-    const float delta_curl   = fabsf(curl_dst - curl_src);
-    const float instanton_len = delta_curl / (ym_action + 1e-8F);
-
     const int slot = atomicAdd(d_n_instantons, 1);
+
     if (slot < k_floer_max_criticals * k_floer_max_criticals)
     {
         d_instantons[slot] = InstantonPath{

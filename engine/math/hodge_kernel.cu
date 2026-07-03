@@ -580,9 +580,6 @@ namespace holo::cuda
         }
         ws.n_harmonic_dims = h_n_harmonic;
 
-        const GpuLobSnapshot *snap = nullptr;
-        (void)snap;
-
         const int blk = k_blk;
         const int grd = (ne + blk - 1) / blk;
 

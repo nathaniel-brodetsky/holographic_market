@@ -10,7 +10,13 @@ cmake-build-*/
 
 # CMake
 CMakeCache.txt
-CMakeFiles/.venv/
+CMakeFiles/
+
+# Python venv
+.venv/
+
+# Logs
+*.log
+
 data/test_data.csv
 data/advanced_metrics.csv
-engine/debug.log
