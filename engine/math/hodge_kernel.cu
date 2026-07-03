@@ -606,7 +606,8 @@ namespace holo::cuda
             ne, ws.d_coexact);
 
         kernel_curl_magnitude<<<grd, blk, 0, stream>>>(
-            ws.d_gamma, ne,
+            ws.d_coexact, ne,   // FIX: was ws.d_gamma (structurally 0 for this
+                                 // graph topology, see extract_arbitrage_signal)
             ws.d_curl_magnitude,
             ws.d_arb_signal,
             k_arbitrage_threshold);
@@ -660,7 +661,13 @@ namespace holo::cuda
         const uint64_t now = static_cast<uint64_t>(ts.tv_sec) * 1'000'000'000ULL + static_cast<uint64_t>(ts.tv_nsec);
 
         return ArbitrageSignal{
-            .d_harmonic_flow = ws.d_gamma,
+            .d_harmonic_flow = ws.d_coexact,   // FIX: was ws.d_gamma, which is
+                                                // structurally always 0 for a
+                                                // fully-triangulated K4 graph
+                                                // (boundary of a tetrahedron =
+                                                // topological sphere => H1 = 0).
+                                                // The actual arbitrage signal
+                                                // lives in the coexact component.
             .d_curl_magnitude = ws.d_curl_magnitude,
             .yang_mills_action = ws.yang_mills_action,
             .n_active_loops = h_count,

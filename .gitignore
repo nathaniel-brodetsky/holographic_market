@@ -10,4 +10,7 @@ cmake-build-*/
 
 # CMake
 CMakeCache.txt
-CMakeFiles/
+CMakeFiles/.venv/
+data/test_data.csv
+data/advanced_metrics.csv
+engine/debug.log

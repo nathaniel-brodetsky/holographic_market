@@ -162,43 +162,34 @@ holographic_market/
 ```bash
 # 1. Clone
 git clone https://github.com/<org>/holographic_market.git
-cd holographic_market
+cd holographic_market/engine
 
-# 2. Provision (Ubuntu 22.04, requires root, ~15–20 min first run)
-sudo bash infra/provision.sh
-
-# 3. Run the engine (live Binance feed, 30-second window)
-cd cpp_engine
-./build/bin/holographic_bench
-
-# 4. Profile
-nsys profile --trace=cuda,nvtx,osrt \
-     -o holographic_profile \
-     ./build/bin/holographic_bench
-nsys-ui holographic_profile.nsys-rep
-```
-
-### Manual build (if provision.sh already ran)
-
-```bash
-cd cpp_engine
-cmake -S . -B build -G Ninja \
+# 2. Configure + build (Release, Ninja, GCC 12, CUDA archs for T4/A100/RTX30xx/L4/L40S)
+rm -rf build/
+cmake -B build -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_CUDA_ARCHITECTURES=native \
     -DCMAKE_C_COMPILER=gcc-12 \
     -DCMAKE_CXX_COMPILER=g++-12 \
-    -DCUML_ROOT=/opt/miniforge3/envs/rapids-holographic
-cmake --build build -j$(nproc)
-./build/bin/holographic_bench
+    -DCMAKE_CUDA_HOST_COMPILER=g++-12 \
+    -DCMAKE_CUDA_ARCHITECTURES="75;80;86;89" \
+    -DBOOST_ROOT=/usr/local \
+    -DBoost_NO_SYSTEM_PATHS=ON
+
+cmake --build build --parallel $(nproc)
+
+# 3a. Run the CSV backtest
+./build/bin/holographic_backtest ../data/test_data.csv
+
+# 3b. Run the live engine (Binance L2 feed + paper execution, Phase IV+V)
+./build/bin/holographic_live
 ```
 
 ### Optional CMake flags
 
 | Flag | Default | Effect |
 |---|---|---|
-| `-DENABLE_ASAN=ON` | OFF | AddressSanitizer + UBSan |
-| `-DENABLE_TSAN=ON` | OFF | ThreadSanitizer |
-| `-DCMAKE_CUDA_ARCHITECTURES=89` | native | Target specific SM (e.g. L4=89, A100=80) |
+| `-DCMAKE_CUDA_ARCHITECTURES="75;80;86;89"` | — | Target SM architectures (T4=75, A100=80, RTX30xx/L4=86, L40S=89) |
+| `-DBOOST_ROOT=/usr/local` | — | Point at a manually-built Boost 1.83+ (required: system, json) |
 
 ---
 

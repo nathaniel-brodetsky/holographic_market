@@ -113,7 +113,6 @@ int main()
     using namespace holo;
     using namespace holo::cuda;
 
-    }
     std::puts("\n");
     print_separator();
     std::puts("  HOLOGRAPHIC MARKET ARCHITECTURE  v0.4.0");
