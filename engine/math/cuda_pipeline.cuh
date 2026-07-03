@@ -106,6 +106,13 @@ struct SignalRecord
     bool          floer_instanton_found{false};
 };
 
+    struct TopologySnapshot {
+        const float* harmonic_flow{nullptr};
+        const int*   edge_src{nullptr};
+        const int*   edge_dst{nullptr};
+        int          n_edges{0};
+    };
+
 class CudaPipeline final
 {
 public:
@@ -123,6 +130,16 @@ public:
 
     void run_once();
     void run_continuous(std::atomic<bool> &shutdown_flag);
+
+    [[nodiscard]] TopologySnapshot last_topology() const noexcept
+    {
+        return TopologySnapshot{
+            .harmonic_flow = h_harmonic_out_,
+            .edge_src      = h_edge_src_,
+            .edge_dst      = h_edge_dst_,
+            .n_edges       = last_signal().n_edges
+        };
+    }
 
     [[nodiscard]] const PipelineMetrics &metrics() const noexcept { return metrics_; }
 
@@ -163,6 +180,8 @@ private:
 
     float *h_harmonic_out_{nullptr};
     float *h_curl_out_{nullptr};
+    int   *h_edge_src_{nullptr};
+    int   *h_edge_dst_{nullptr};
 
     PipelineMetrics  metrics_;
 

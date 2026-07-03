@@ -44,6 +44,8 @@ namespace holo::cuda
             compute_stream_);
 
         h_harmonic_out_ = pinned_alloc<float>(static_cast<size_t>(k_max_edges));
+        h_edge_src_ = pinned_alloc<int>(k_max_edges);
+        h_edge_dst_ = pinned_alloc<int>(k_max_edges);
         h_curl_out_ = pinned_alloc<float>(static_cast<size_t>(k_max_edges));
 
         std::memset(h_harmonic_out_, 0, static_cast<size_t>(k_max_edges) * sizeof(float));
@@ -60,10 +62,10 @@ namespace holo::cuda
 
         delete gpu_mirror_;
 
-        if (h_harmonic_out_)
-            cudaFreeHost(h_harmonic_out_);
-        if (h_curl_out_)
-            cudaFreeHost(h_curl_out_);
+        if (h_harmonic_out_) cudaFreeHost(h_harmonic_out_);
+        if (h_curl_out_)     cudaFreeHost(h_curl_out_);
+        if (h_edge_src_)     cudaFreeHost(h_edge_src_);
+        if (h_edge_dst_)     cudaFreeHost(h_edge_dst_);
     }
 
     void CudaPipeline::init_gpu(int device)
@@ -212,6 +214,18 @@ namespace holo::cuda
             sig.n_edges,
             signal_stream_);
 
+        CUDA_CHECK(cudaMemcpyAsync(
+            h_edge_src_, hodge_ws_.d_edge_src,
+            sig.n_edges * sizeof(int),
+            cudaMemcpyDeviceToHost, signal_stream_.get()
+        ));
+
+        CUDA_CHECK(cudaMemcpyAsync(
+            h_edge_dst_, hodge_ws_.d_edge_dst,
+            sig.n_edges * sizeof(int),
+            cudaMemcpyDeviceToHost, signal_stream_.get()
+        ));
+
         CUDA_CHECK(cudaStreamSynchronize(signal_stream_));
 
         float max_curl = 0.0F;
@@ -234,6 +248,7 @@ namespace holo::cuda
             .n_harmonic_dims = hodge_ws_.n_harmonic_dims,
             .max_curl = max_curl,
             .mean_curl = mean_curl,
+            .n_edges = sig.n_edges
         };
         run_floer_pass(new_rec);
         signal_history_[idx] = new_rec;

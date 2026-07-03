@@ -217,10 +217,10 @@ int main(int argc, char **argv) {
     PnlTracker               pnl;
     SignalRouter::TopKBuffer top_edges{};
 
-    std::vector<int> edge_src, edge_dst;
-    for (int i = 0; i < 4; ++i)
-        for (int j = 0; j < 4; ++j)
-            if (i != j) { edge_src.push_back(i); edge_dst.push_back(j); }
+    //std::vector<int> edge_src, edge_dst;
+    //for (int i = 0; i < 4; ++i)
+    //    for (int j = 0; j < 4; ++j)
+    //        if (i != j) { edge_src.push_back(i); edge_dst.push_back(j); }
 
     const auto t_start = std::chrono::steady_clock::now();
     replay.start();
@@ -253,22 +253,25 @@ int main(int argc, char **argv) {
                 const auto sig = gpu_pipeline.last_signal();
 
                 if (sig.yang_mills_action > 1e-4F) {
-                    std::vector<float> h_curl_flow(12, sig.yang_mills_action / 12.0F);
-                    const std::size_t n_routed = router.route(
-                        sig,
-                        std::span<const float>{h_curl_flow},
-                        std::span<const int>{edge_src},
-                        std::span<const int>{edge_dst},
-                        top_edges);
+                    const auto topo = gpu_pipeline.last_topology();
 
-                    for (std::size_t r = 0U; r < n_routed; ++r) {
-                        const auto &re = top_edges[r];
-                        pnl.record(
-                            re,
-                            lob_soa.mid_price(re.src_instrument),
-                            lob_soa.mid_price(re.dst_instrument),
-                            lob_soa.spread(re.src_instrument),
-                            sig);
+                    if (topo.n_edges > 0 && topo.harmonic_flow != nullptr) {
+                        const std::size_t n_routed = router.route(
+                            sig,
+                            std::span<const float>{topo.harmonic_flow, static_cast<std::size_t>(topo.n_edges)},
+                            std::span<const int>{topo.edge_src,        static_cast<std::size_t>(topo.n_edges)},
+                            std::span<const int>{topo.edge_dst,        static_cast<std::size_t>(topo.n_edges)},
+                            top_edges);
+
+                        for (std::size_t r = 0U; r < n_routed; ++r) {
+                            const auto &re = top_edges[r];
+                            pnl.record(
+                                re,
+                                lob_soa.mid_price(re.src_instrument),
+                                lob_soa.mid_price(re.dst_instrument),
+                                lob_soa.spread(re.src_instrument),
+                                sig);
+                        }
                     }
                 }
                 next_gpu_target += 2048U;

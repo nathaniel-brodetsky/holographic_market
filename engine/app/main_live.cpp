@@ -102,49 +102,10 @@ namespace holo
     // decomposition. The accessor is declared extern here; the pipeline
     // must expose it or we provide a fallback synthetic signal for routing.
 
-    static constexpr std::size_t k_max_complete_edges =
-        k_n_instruments * (k_n_instruments - 1U) / 2U;  // C(4,2) = 6
 
-    struct alignas(64) HostCurlBuffer
-    {
-        std::array<float, k_max_complete_edges> flow{};
-        std::array<int,   k_max_complete_edges> src{};
-        std::array<int,   k_max_complete_edges> dst{};
-        std::size_t n_edges{0U};
-    };
-
-    // Populate edge topology for complete graph K_N.
-    static void init_edge_topology(HostCurlBuffer& buf, std::size_t n) noexcept
-    {
-        buf.n_edges = 0U;
-        for (std::size_t i = 0U; i < n; ++i)
-            for (std::size_t j = i + 1U; j < n; ++j)
-            {
-                buf.src[buf.n_edges] = static_cast<int>(i);
-                buf.dst[buf.n_edges] = static_cast<int>(j);
-                buf.flow[buf.n_edges] = 0.0F;
-                ++buf.n_edges;
-            }
-    }
 
     // Synthesize harmonic flows from last signal for routing when no
     // direct GPU pointer is accessible from this translation unit.
-    static void synth_curl_from_signal(
-        HostCurlBuffer& buf,
-        const cuda::SignalRecord& sig,
-        const LobSoA& lob) noexcept
-    {
-        for (std::size_t e = 0U; e < buf.n_edges; ++e)
-        {
-            const std::size_t i = static_cast<std::size_t>(buf.src[e]);
-            const std::size_t j = static_cast<std::size_t>(buf.dst[e]);
-            const float mi = lob.mid_price(i);
-            const float mj = lob.mid_price(j);
-            const float denom = mi + mj + 1e-8F;
-            // Proxy curl: spread-weighted flow modulated by YM action.
-            buf.flow[e] = (mi - mj) / denom * sig.yang_mills_action;
-        }
-    }
 } // namespace holo
 
 int main()
@@ -212,9 +173,6 @@ int main()
     CudaPipeline pipeline{*lob_ptr, arena, 0};
     SignalRouter  router{k_n_instruments};
 
-    HostCurlBuffer curl_buf{};
-    init_edge_topology(curl_buf, k_n_instruments);
-
     // ── Phase V: Execution engine (paper trading, testnet) ───────────────
     // Use empty credentials for paper-only stub.
     ExecutionEngine exec_engine{
@@ -261,30 +219,33 @@ int main()
         print_phase4_status(sig, feed.metrics(), router.metrics(), elapsed);
 
         // Route only on new signal generation.
+        // Route only on new signal generation.
         if (sig.timestamp_ns != last_sig_gen && sig.timestamp_ns != 0U)
         {
             last_sig_gen = sig.timestamp_ns;
 
-            synth_curl_from_signal(curl_buf, sig, *lob_ptr);
+            const auto topo = pipeline.last_topology();
 
-            SignalRouter::TopKBuffer top_edges{};
-            const std::size_t n_routed = router.route(
-                sig,
-                std::span<const float>{curl_buf.flow.data(), curl_buf.n_edges},
-                std::span<const int>{curl_buf.src.data(), curl_buf.n_edges},
-                std::span<const int>{curl_buf.dst.data(), curl_buf.n_edges},
-                top_edges);
-
-            for (std::size_t k = 0U; k < n_routed; ++k)
+            if (topo.n_edges > 0 && topo.harmonic_flow != nullptr)
             {
-                const auto& edge = top_edges[k];
-                exec_engine.submit(
-                    edge,
-                    lob_ptr->mid_price(edge.src_instrument),
-                    lob_ptr->mid_price(edge.dst_instrument));
+                SignalRouter::TopKBuffer top_edges{};
+                const std::size_t n_routed = router.route(
+                    sig,
+                    std::span<const float>{topo.harmonic_flow, static_cast<std::size_t>(topo.n_edges)},
+                    std::span<const int>{topo.edge_src,        static_cast<std::size_t>(topo.n_edges)},
+                    std::span<const int>{topo.edge_dst,        static_cast<std::size_t>(topo.n_edges)},
+                    top_edges);
+
+                for (std::size_t k = 0U; k < n_routed; ++k)
+                {
+                    const auto& edge = top_edges[k];
+                    exec_engine.submit(
+                        edge,
+                        lob_ptr->mid_price(edge.src_instrument),
+                        lob_ptr->mid_price(edge.dst_instrument));
+                }
             }
         }
-    }
 
     std::puts("\n");
     shutdown.store(true, std::memory_order_release);
