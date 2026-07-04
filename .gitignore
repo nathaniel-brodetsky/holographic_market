@@ -19,4 +19,7 @@ CMakeFiles/
 *.log
 
 data/test_data.csv
-data/advanced_metrics.csv
+data/advanced_metrics.csvdata/
+*.csv
+!infra/*.csv
+multi_day_results.txt
