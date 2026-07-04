@@ -29,7 +29,7 @@ namespace holo
     static constexpr std::size_t  k_depth_levels     = 16U;
     static constexpr std::size_t  k_ring_capacity    = 1U << 17U;
     static constexpr std::size_t  k_arena_size_bytes = 256U * 1024U * 1024U;
-    static constexpr std::uint64_t k_pipeline_run_ns = 30'000'000'000ULL;
+    static constexpr std::uint64_t k_pipeline_run_ns = 30'000'000'000ULL * 960;
 
     [[nodiscard]] static std::uint64_t now_ns() noexcept
     {
