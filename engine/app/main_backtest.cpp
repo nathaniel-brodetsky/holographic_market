@@ -40,19 +40,31 @@ struct TickRecord {
     float         spread_bps;
 };
 
+// Effective k_alpha for the EWMA baseline. Reads HOLO_K_ALPHA once (cached in
+// a function-local static), falls back to 0.02 if unset/unparseable.
+static double active_k_alpha() noexcept {
+    static const double v = [] {
+        if (const char *env = std::getenv("HOLO_K_ALPHA")) {
+            try { return std::stod(env); } catch (...) { /* fall through */ }
+        }
+        return 0.02;
+    }();
+    return v;
+}
+
 struct EwmaPair {
     double mu{0.0};
     double m2{1e-8};
     bool   warm{false};
-    static constexpr double k_alpha         = 0.02;
     static constexpr double k_min_sigma     = 1e-5;
     static constexpr float  k_max_gross_bps = 5.0F;
 
     double update(double log_ratio) noexcept {
         if (!warm) { mu = log_ratio; m2 = 1e-8; warm = true; return 0.0; }
+        const double alpha = active_k_alpha();
         const double diff = log_ratio - mu;
-        mu += k_alpha * diff;
-        m2  = (1.0 - k_alpha) * m2 + k_alpha * diff * diff;
+        mu += alpha * diff;
+        m2  = (1.0 - alpha) * m2 + alpha * diff * diff;
         const double sigma = std::sqrt(std::max(m2, k_min_sigma * k_min_sigma));
         return (log_ratio - mu) / sigma;
     }
@@ -182,6 +194,9 @@ int main(int argc, char **argv) {
     if (argc < 2) { std::puts("Usage: backtest <lob_data.csv>"); return 1; }
 
     const CliArgs cli = parse_args(argc, argv);
+    std::fprintf(stderr, "[CONFIG] HOLO_K_ALPHA effective = %.6f%s\n",
+                 active_k_alpha(),
+                 std::getenv("HOLO_K_ALPHA") ? " (from env)" : " (default)");
     MemoryArena   arena{cli.arena_mb * 1024UL * 1024UL};
 
     LobSoA lob_soa{arena, 4U, 1U};
