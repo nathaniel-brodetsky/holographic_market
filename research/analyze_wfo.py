@@ -137,7 +137,7 @@ def compute_regime_metrics(cache_dir: str, dates) -> pd.DataFrame:
             continue
         try:
             raw = pd.read_csv(f, header=None, names=col_names,
-                               usecols=["timestamp_ns", "instrument_id", "bid_price", "ask_price"])
+                              usecols=["timestamp_ns", "instrument_id", "bid_price", "ask_price"])
         except Exception as e:
             print(f"  (regime) skipping {date_str}: {e}", file=sys.stderr)
             continue
@@ -158,7 +158,15 @@ def compute_regime_metrics(cache_dir: str, dates) -> pd.DataFrame:
             # instrument hits that cap, its rows for that day are truncated
             # to roughly the FIRST part of the day only -- not a random
             # sample, and not aligned with the other (uncapped) instruments.
-            if len(grp) >= 499_000:
+            # NB: infra/download_binance_aggtrades.py (the OLD, capped
+            # downloader) truncated at EXACTLY nrows=500_000. The new
+            # infra/download_binance_aggtrades_v2.py has no cap, so a day
+            # can legitimately have several million rows -- that's no
+            # longer suspicious by itself. Only flag the exact old
+            # truncation signature (==500_000), not "large but real" counts,
+            # or every high-volume day on the fixed pipeline will falsely
+            # trip this warning.
+            if len(grp) == 500_000:
                 cap_hits.append(instr)
                 ts = grp["timestamp_ns"].to_numpy()
                 covered = (ts.max() - ts.min()) / day_span_ns
@@ -198,13 +206,13 @@ def main():
     ap.add_argument("--grid", default="data/sharpe_grid.csv")
     ap.add_argument("--window", type=int, default=10)
     ap.add_argument("--exclude-month", action="append", default=[],
-                     help="YYYY-MM to exclude from OOS results, e.g. --exclude-month 2026-06. "
-                          "Repeatable.")
+                    help="YYYY-MM to exclude from OOS results, e.g. --exclude-month 2026-06. "
+                         "Repeatable.")
     ap.add_argument("--regime", action="store_true",
-                     help="Also compute rough daily volatility/range from the cached tick "
-                          "data and correlate it with OOS Sharpe.")
+                    help="Also compute rough daily volatility/range from the cached tick "
+                         "data and correlate it with OOS Sharpe.")
     ap.add_argument("--cache-dir", default="data/wfo_cache",
-                     help="Where the per-day tick CSVs live (only used with --regime).")
+                    help="Where the per-day tick CSVs live (only used with --regime).")
     args = ap.parse_args()
 
     df = load_grid(args.grid)
@@ -323,8 +331,13 @@ def main():
             n_capped_days = int((regime["n_instruments_capped"] > 0).sum())
             if n_capped_days > 0:
                 print(f"\n  WARNING: {n_capped_days}/{len(regime)} days had at least one "
-                      f"instrument hit the downloader's 500,000-row cap. On those days that "
-                      f"instrument's data covers only roughly the FIRST part of the day "
+                      f"instrument with EXACTLY 500,000 rows -- the old downloader's "
+                      f"truncation signature. If you're reading from data/wfo_cache (the "
+                      f"legacy, capped cache), this means real truncation: that instrument's "
+                      f"data covers only roughly the FIRST part of the day. If you're reading "
+                      f"from data/wfo_cache_v2 (the uncapped downloader) and still see this, "
+                      f"it's very likely a coincidental exact count, not truncation -- verify "
+                      f"before treating it as a data-quality issue."
                       f"(the raw archive is time-ordered and gets truncated), not the full "
                       f"24h, and not aligned with uncapped instruments on the same day. This "
                       f"is a real confound, independent of alpha tuning -- worth checking "
