@@ -1,4 +1,31 @@
 #!/usr/bin/env bash
+# *** DEPRECATED ***
+# Replaced by the (day, alpha) grid + Python analysis pipeline:
+#   infra/download_historical_range_v2.sh <start> <end>
+#   infra/build_sharpe_grid_v2.sh
+#   python3 research/analyze_wfo.py --grid data/sharpe_grid_v2.csv --window 10
+#
+# Why: this script (a) re-invokes the backtest binary once per (day, alpha)
+# PER OVERLAPPING WINDOW instead of once each -- fine for 20 days, prohibitive
+# for months of history -- and (b) calls the now-hard-deprecated
+# infra/download_binance_aggtrades.py, which truncates BTCUSDT/ETHUSDT at
+# 500,000 rows/day and meaningfully distorted an earlier WFO analysis (see
+# git history). It has no --regime / --exclude-month / bootstrap-significance
+# support either. There's no reason to keep using it.
+#
+# This script now hard-exits unless RUN_WFO_I_UNDERSTAND_DEPRECATED=1 is set,
+# so it can't be run by old habit and silently regenerate results from the
+# capped downloader.
+if [ "${RUN_WFO_I_UNDERSTAND_DEPRECATED:-0}" != "1" ]; then
+    echo "FATAL: infra/run_wfo.sh is deprecated. Use instead:" >&2
+    echo "    infra/download_historical_range_v2.sh <start> <end>" >&2
+    echo "    infra/build_sharpe_grid_v2.sh" >&2
+    echo "    python3 research/analyze_wfo.py --grid data/sharpe_grid_v2.csv --window 10" >&2
+    echo "If you specifically need this legacy script (e.g. a regression" >&2
+    echo "comparison), set RUN_WFO_I_UNDERSTAND_DEPRECATED=1." >&2
+    exit 1
+fi
+
 # Walk-forward optimization over the last 20 days.
 # Days 1-10 of the window: calibration pool only (never scored as OOS).
 # Days 11-20: for each, pick k_alpha by best Sharpe over the PRECEDING 10 days,
