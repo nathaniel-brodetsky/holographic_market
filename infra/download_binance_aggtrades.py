@@ -1,5 +1,28 @@
 #!/usr/bin/env python3
 """
+*** DEPRECATED -- DO NOT USE FOR NEW DOWNLOADS ***
+Use infra/download_binance_aggtrades_v2.py instead.
+
+This script silently truncates each symbol at nrows=500_000 when reading
+the raw (time-ordered) daily archive. On most days BTCUSDT and ETHUSDT
+exceed that count, so their data here covers only roughly the FIRST part
+of the day -- not the full 24h, and not aligned with SOL/BNB (which
+usually stay under the cap and so cover the whole day). This was
+discovered to have meaningfully distorted an earlier WFO analysis (see
+git history / research/analyze_wfo.py --regime) before being traced back
+to this cap.
+
+The v2 script is a drop-in replacement (same --date CLI, same
+data/test_data.csv output, same column schema) with no row cap, chunked/
+vectorized parsing, checksum verification, and retry/backoff. There is no
+reason to use this version going forward.
+
+Running this script now hard-exits unless --i-understand-this-is-capped
+is explicitly passed, so it can't be invoked by old habit or muscle
+memory and silently regenerate truncated data.
+
+--- Original docstring below, kept for history ---
+
 Drop-in replacement for download_binance_data.py, but sourced from `aggTrades`
 daily archives (still actively published by Binance) instead of `bookTicker`
 (frozen since 2024, see https://dev.binance.vision/t/.../36122).
@@ -77,8 +100,8 @@ def _fetch_and_transform(task: DownloadTask):
         bid_qty = ask_qty = 0.0
         rows = []
         for price, qty, ts, buyer_is_maker in zip(
-            df["price"].to_numpy(), df["quantity"].to_numpy(),
-            df["transact_time"].to_numpy(), df["is_buyer_maker"].to_numpy()
+                df["price"].to_numpy(), df["quantity"].to_numpy(),
+                df["transact_time"].to_numpy(), df["is_buyer_maker"].to_numpy()
         ):
             if buyer_is_maker:
                 # taker sold -> hit the bid
@@ -101,7 +124,26 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     parser = argparse.ArgumentParser()
     parser.add_argument("--date", required=True, help="YYYY-MM-DD")
+    parser.add_argument(
+        "--i-understand-this-is-capped", action="store_true",
+        help="Required to run this deprecated, truncating script. Use "
+             "infra/download_binance_aggtrades_v2.py instead unless you have "
+             "a specific reason to reproduce the old capped behavior.",
+    )
     args = parser.parse_args()
+
+    if not args.i_understand_this_is_capped:
+        logging.error(
+            "This script is DEPRECATED: it silently truncates BTCUSDT/ETHUSDT "
+            "at 500,000 rows/day (covering only roughly the first part of the "
+            "day on high-volume days). Use "
+            "infra/download_binance_aggtrades_v2.py instead -- it's a drop-in "
+            "replacement with no cap. If you specifically need to reproduce "
+            "the old capped behavior (e.g. for a regression comparison), "
+            "pass --i-understand-this-is-capped."
+        )
+        sys.exit(1)
+
     target_date = date.fromisoformat(args.date)
     logging.info(f"Target date: {target_date}")
 
