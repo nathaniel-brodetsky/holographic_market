@@ -15,7 +15,7 @@ namespace holo::net
 {
 
 static constexpr std::size_t k_signal_router_top_k = 3U;
-static constexpr float       k_signal_min_curl      = 1e-4F;
+static constexpr float       k_signal_min_curl = 0.002F;
 
 struct alignas(32) RoutedEdge
 {

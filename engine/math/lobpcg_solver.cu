@@ -35,7 +35,7 @@ __global__ void kernel_build_complete_laplacian(
     {
         if (j == i) continue;
         const float mj = mid_price(d_bid, d_ask, j, depth);
-        const float w  = expf(-fabsf(mi - mj) / (sigma + 1e-8f));
+        const float w  = expf(-fabsf(logf(mi / (mj + 1e-8f))) / (sigma + 1e-8f));
         d_col_idx[cur] = j;
         d_values[cur]  = -w;
         degree += w;
