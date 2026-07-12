@@ -51,7 +51,7 @@ namespace holo::cuda
             const float imb_i = (vol_i > 1e-9F) ? (qbi - qai) / vol_i : 0.0F;
             const float imb_j = (vol_j > 1e-9F) ? (qbj - qaj) / vol_j : 0.0F;
 
-            flow += (mid_j - mid_i) * (imb_i - imb_j);
+            flow += logf(mid_j / (mid_i + 1e-8F)) * (imb_i - imb_j);
         }
 
         d_omega[e] = flow;
