@@ -49,6 +49,19 @@ namespace holo::core
 
     static_assert(sizeof(LobStats) == k_cache_line);
 
+    // Single-writer seqlock counter guarding LobSoA's raw arrays.
+    // Kept on its own cache line (isolated from LobStats) since it is
+    // touched on every single apply() call by the writer AND polled in
+    // a tight retry loop by GpuLobMirror's reader — sharing a line with
+    // anything else would cause needless false sharing.
+    struct alignas(k_cache_line) LobSeqLock
+    {
+        std::atomic<std::uint64_t> value{0U};
+        std::byte _pad[k_cache_line - sizeof(std::atomic<std::uint64_t>)];
+    };
+
+    static_assert(sizeof(LobSeqLock) == k_cache_line);
+
     class alignas(k_cache_line) LobSoA final
     {
     public:
@@ -66,6 +79,7 @@ namespace holo::core
             , seq_nos_   {arena.alloc_span<std::uint32_t>(n_instruments * depth * k_sides)}
             , last_ts_ns_{arena.alloc_span<std::uint64_t>(n_instruments)}
             , stats_     {arena.emplace<LobStats>()}
+            , seq_       {arena.emplace<LobSeqLock>()}
         {
             for (std::size_t i = 0U; i < bid_prices_.size(); ++i)
             {
@@ -95,6 +109,15 @@ namespace holo::core
 
             const std::size_t base = instr * depth_ + depth;
 
+            // --- Seqlock write-side (single writer thread only) -----------
+            // Flip to odd ("write in flight"), do all the mutations, flip
+            // back to even ("stable"). GpuLobMirror::stage_snapshot() reads
+            // this counter around its host-side copy and retries whenever
+            // it observes an odd value or a value that changed mid-copy,
+            // instead of racing directly against these array writes.
+            seq_->value.fetch_add(1U, std::memory_order_relaxed);
+            std::atomic_thread_fence(std::memory_order_release);
+
             if (u.side == Side::Bid)
             {
                 bid_prices_[base] = u.price;
@@ -116,8 +139,19 @@ namespace holo::core
             seq_nos_[seq_base] = static_cast<std::uint32_t>(
                 stats_->total_updates.load(std::memory_order_relaxed));
             last_ts_ns_[instr] = u.timestamp_ns;
+
+            std::atomic_thread_fence(std::memory_order_release);
+            seq_->value.fetch_add(1U, std::memory_order_relaxed);
+
             stats_->total_updates.fetch_add(1U, std::memory_order_relaxed);
         }
+
+        // Current seqlock counter value. Even == stable/quiescent,
+        // odd == a write is currently in progress. Used by readers
+        // (e.g. GpuLobMirror) to take consistent snapshots without
+        // blocking the writer.
+        [[nodiscard]] std::uint64_t seq() const noexcept
+        { return seq_->value.load(std::memory_order_relaxed); }
 
         // ── Level-0 accessors (best bid / best ask) ──────────────────────
 
@@ -196,6 +230,7 @@ namespace holo::core
         alignas(k_cache_line) std::span<std::uint64_t>  last_ts_ns_;
 
         LobStats *stats_;
+        LobSeqLock *seq_;
     };
 
 } // namespace holo::core

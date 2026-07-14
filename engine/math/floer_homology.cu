@@ -4,6 +4,7 @@
 #include <cstring>
 #include <cstdio>
 #include <cmath>
+#include <cassert>
 
 namespace holo::cuda
 {
@@ -341,19 +342,24 @@ FloerRecord run_floer_analysis(
         CUDA_CHECK(cudaStreamSynchronize(stream));
     }
 
-    CriticalPoint h_criticals[k_floer_max_criticals]{};
-    InstantonPath h_instantons[k_floer_max_criticals * 4]{};
-    int           h_boundary[k_floer_max_criticals * k_floer_max_criticals]{};
+    // FIX: these used to be fixed-size stack arrays. h_instantons in
+    // particular was sized k_floer_max_criticals * 4 (1024 entries) while
+    // h_n_instantons is bounded above by k_floer_max_criticals^2 (65536) —
+    // a real, reachable stack buffer overflow. We now copy into the
+    // workspace's preallocated pinned host buffers, which are sized to the
+    // true upper bound and allocated once (not on every call).
+    assert(h_n_criticals  <= ws.max_criticals);
+    assert(h_n_instantons <= ws.max_criticals * ws.max_criticals);
 
-    CUDA_CHECK(cudaMemcpy(h_criticals, ws.d_criticals,
-        h_n_criticals * sizeof(CriticalPoint), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(h_instantons, ws.d_instantons,
-        h_n_instantons * sizeof(InstantonPath), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(h_boundary, ws.d_boundary_matrix,
-        h_n_criticals * h_n_criticals * sizeof(int), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(ws.h_criticals, ws.d_criticals,
+        static_cast<size_t>(h_n_criticals) * sizeof(CriticalPoint), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(ws.h_instantons, ws.d_instantons,
+        static_cast<size_t>(h_n_instantons) * sizeof(InstantonPath), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(ws.h_boundary_matrix, ws.d_boundary_matrix,
+        static_cast<size_t>(h_n_criticals) * static_cast<size_t>(h_n_criticals) * sizeof(int), cudaMemcpyDeviceToHost));
 
     return compute_floer_homology(
-        h_criticals, h_instantons, h_boundary,
+        ws.h_criticals, ws.h_instantons, ws.h_boundary_matrix,
         h_n_criticals, h_n_instantons);
 }
 

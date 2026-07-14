@@ -31,6 +31,22 @@ struct alignas(16) GpuLobSnapshot
     std::uint64_t transfer_ts_ns{0U};
 };
 
+// Diagnostics for the seqlock-guarded staging copy in GpuLobMirror.
+// snapshots_taken / retries let us confirm in production that the writer
+// never actually starves the reader (retries should stay ~0..low single
+// digits); forced_after_max_retries should stay at 0 forever — if it
+// isn't, the bounded-retry fallback below is firing and a torn snapshot
+// may have been pushed to the GPU.
+struct alignas(holo::core::k_cache_line) MirrorMetrics
+{
+    std::atomic<std::uint64_t> snapshots_taken{0U};
+    std::atomic<std::uint64_t> retries{0U};
+    std::atomic<std::uint64_t> forced_after_max_retries{0U};
+    std::byte _pad[holo::core::k_cache_line - 3U * sizeof(std::atomic<std::uint64_t>)];
+};
+
+static_assert(sizeof(MirrorMetrics) == holo::core::k_cache_line);
+
 class GpuLobMirror final
 {
 public:
@@ -48,23 +64,42 @@ public:
     [[nodiscard]] std::size_t n_floats()      const noexcept { return n_floats_; }
     [[nodiscard]] std::size_t n_instruments() const noexcept { return n_instruments_; }
     [[nodiscard]] std::size_t depth()         const noexcept { return depth_; }
+    [[nodiscard]] const MirrorMetrics &metrics() const noexcept { return metrics_; }
 
 private:
+    // Seqlock-guarded host-to-host copy: reads a consistent snapshot of
+    // LobSoA's raw arrays into the pinned staging buffers below. Bounded
+    // retry loop -- see .cu for rationale.
+    void stage_snapshot() noexcept;
+
     std::size_t  n_instruments_;
     std::size_t  depth_;
     std::size_t  n_floats_;
     cudaStream_t stream_;
     std::uint64_t generation_;
 
+    const holo::core::LobSoA *lob_ref_;
+
     const float *h_bid_prices_;
     const float *h_ask_prices_;
     const float *h_bid_qtys_;
     const float *h_ask_qtys_;
 
+    // Pinned staging (shadow) buffers. stage_snapshot() copies a
+    // seqlock-verified consistent snapshot from h_*_ into these; only
+    // THESE are ever the source of cudaMemcpyAsync, so the async DMA
+    // never races against LobSoA's writer thread.
+    float *stage_bid_prices_{nullptr};
+    float *stage_ask_prices_{nullptr};
+    float *stage_bid_qtys_{nullptr};
+    float *stage_ask_qtys_{nullptr};
+
     float *d_bid_prices_{nullptr};
     float *d_ask_prices_{nullptr};
     float *d_bid_qtys_{nullptr};
     float *d_ask_qtys_{nullptr};
+
+    MirrorMetrics metrics_{};
 };
 
 struct alignas(64) PipelineMetrics

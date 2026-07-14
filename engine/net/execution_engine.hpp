@@ -250,6 +250,17 @@ private:
             const float rpnl = (is_buy ? -1.0F : 1.0F) * closed * (price - prev_ep);
             pos.realized_pnl.fetch_add(rpnl, std::memory_order_relaxed);
             metrics_.total_pnl.fetch_add(rpnl, std::memory_order_relaxed);
+
+            // FIX: if this fill fully closes the old side AND opens a new
+            // position in the opposite direction ("flip"), the residual
+            // quantity's cost basis is the CURRENT fill price — not the
+            // old position's entry price. Previously avg_entry_price was
+            // left untouched here, so it silently carried over from the
+            // just-closed opposite-sign position and corrupted every
+            // subsequent realized-PnL calculation for this instrument.
+            if (qty > std::abs(prev_qty)) {
+                pos.avg_entry_price.store(price, std::memory_order_relaxed);
+            }
             pos.net_qty.store(new_qty, std::memory_order_relaxed);
         }
         pos.n_orders.fetch_add(1U, std::memory_order_relaxed);

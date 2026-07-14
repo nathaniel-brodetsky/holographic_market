@@ -63,18 +63,31 @@ struct FloerWorkspace final
     int            *d_n_criticals{nullptr};
     int            *d_n_instantons{nullptr};
 
-    void allocate(int max_criticals)
+    // Host-side mirrors, sized to the SAME upper bounds as the device
+    // buffers above. Allocated once here (pinned, for fast D2H copies)
+    // instead of as oversized/undersized stack arrays inside
+    // run_floer_analysis(), which is called every pipeline cycle.
+    CriticalPoint  *h_criticals{nullptr};
+    InstantonPath  *h_instantons{nullptr};
+    int            *h_boundary_matrix{nullptr};
+    int             max_criticals{0};
+
+    void allocate(int max_criticals_)
     {
-        CUDA_CHECK(cudaMalloc(&d_criticals,
-            max_criticals * sizeof(CriticalPoint)));
-        CUDA_CHECK(cudaMalloc(&d_instantons,
-            max_criticals * max_criticals * sizeof(InstantonPath)));
-        CUDA_CHECK(cudaMalloc(&d_hessian,
-            max_criticals * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&d_boundary_matrix,
-            max_criticals * max_criticals * sizeof(int)));
+        max_criticals = max_criticals_;
+        const size_t mc  = static_cast<size_t>(max_criticals_);
+        const size_t mc2 = mc * mc;
+
+        CUDA_CHECK(cudaMalloc(&d_criticals,       mc  * sizeof(CriticalPoint)));
+        CUDA_CHECK(cudaMalloc(&d_instantons,      mc2 * sizeof(InstantonPath)));
+        CUDA_CHECK(cudaMalloc(&d_hessian,         mc  * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_boundary_matrix, mc2 * sizeof(int)));
         CUDA_CHECK(cudaMalloc(&d_n_criticals, sizeof(int)));
         CUDA_CHECK(cudaMalloc(&d_n_instantons, sizeof(int)));
+
+        h_criticals       = pinned_alloc<CriticalPoint>(mc);
+        h_instantons      = pinned_alloc<InstantonPath>(mc2);
+        h_boundary_matrix = pinned_alloc<int>(mc2);
     }
 
     void free_all() noexcept
@@ -83,6 +96,11 @@ struct FloerWorkspace final
         ff(d_criticals); ff(d_instantons); ff(d_hessian);
         ff(d_boundary_matrix); ff(d_n_criticals); ff(d_n_instantons);
         d_criticals = nullptr; d_instantons = nullptr;
+
+        pinned_free(h_criticals);
+        pinned_free(h_instantons);
+        pinned_free(h_boundary_matrix);
+        h_criticals = nullptr; h_instantons = nullptr; h_boundary_matrix = nullptr;
     }
 
     ~FloerWorkspace() noexcept { free_all(); }

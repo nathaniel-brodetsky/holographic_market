@@ -1,4 +1,3 @@
-#include <math/gpu_lob_mirror.cuh>
 #include <math/hodge_kernel.cuh>
 #include <math/cuda_utils.cuh>
 
