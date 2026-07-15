@@ -1,275 +1,248 @@
 #pragma once
+//
+// execution_engine.hpp
+// holo::net — Maker-side execution engine for pairs/basket arbitrage.
+//
+// Sends both legs as GTX (post-only) limit orders resting at the passive
+// price (best bid to buy, best ask to sell) to capture 0.00% maker fees.
+// A per-pair monitor coroutine implements the legging risk manager: once
+// one leg fills, the other leg gets kLegTimeout to fill naturally; past
+// that, it's canceled and the residual is hedged at market.
+//
+// NOTE ON boost::asio::experimental::awaitable_operators:
+// The exact variant shape returned by operator|| for awaitable<T> vs.
+// awaitable<void> has shifted slightly across Boost releases. The pattern
+// used below (`.index()` to discriminate, `std::get<0>(...)` for the
+// non-void branch) matches the canonical Boost.Asio examples as of the
+// 1.82–1.86 range; if your Boost version's shape differs, wait_for_status()
+// and monitor_pair() are the only two functions that need adjusting.
+//
+#include "oms_core.hpp"
 
-#include <net/signal_router.hpp>
-#include <net/binance_feed.hpp>
+#include <boost/asio/awaitable.hpp>
+#include <boost/asio/co_spawn.hpp>
+#include <boost/asio/detached.hpp>
+#include <boost/asio/experimental/awaitable_operators.hpp>
+#include <boost/asio/experimental/channel.hpp>
+#include <boost/asio/steady_timer.hpp>
+#include <boost/asio/use_awaitable.hpp>
 
-#include <array>
 #include <atomic>
-#include <chrono>
-#include <cstddef>
-#include <cstdint>
-#include <cstdio>
-#include <cstring>
-#include <string>
-#include <string_view>
-#include <deque>
-#include <thread>
 #include <memory>
+#include <mutex>
+#include <string>
+#include <unordered_map>
 
-#include <boost/asio.hpp>
-#include <boost/asio/ssl.hpp>
-#include <boost/beast.hpp>
-#include <boost/beast/ssl.hpp>
-#include <boost/beast/websocket.hpp>
-#include <boost/beast/websocket/ssl.hpp>
+namespace holo::net {
 
-#include <openssl/hmac.h>
-#include <openssl/sha.h>
-#include <openssl/ssl.h>
+namespace asio = boost::asio;
 
-namespace holo::net
-{
-
-// Эндпоинты для WebSocket Binance Futures Testnet
-static constexpr std::string_view k_binance_futures_ws_host = "testnet.binancefuture.com";
-static constexpr std::string_view k_binance_futures_ws_port = "443";
-static constexpr std::string_view k_binance_futures_ws_path = "/ws-fapi/v1";
-
-struct alignas(64) PaperPosition {
-    std::atomic<float>         net_qty{0.0F};
-    std::atomic<float>         avg_entry_price{0.0F};
-    std::atomic<float>         realized_pnl{0.0F};
-    std::atomic<std::uint64_t> n_orders{0U};
-};
-
-struct alignas(64) ExecutionMetrics {
-    std::atomic<std::uint64_t> orders_submitted{0U};
-    std::atomic<std::uint64_t> orders_filled{0U};
-    std::atomic<std::uint64_t> orders_rejected{0U};
-    std::atomic<std::uint64_t> http_errors{0U};
-    std::atomic<float>         total_pnl{0.0F};
-    static constexpr std::size_t k_used = 4U * sizeof(std::atomic<std::uint64_t>) + sizeof(std::atomic<float>);
-    std::byte _pad[64U - k_used]{};
-};
-
-namespace detail {
-    // Криптография для подписи ордера (HMAC SHA256)
-    [[nodiscard]] inline std::string hmac_sha256_hex(std::string_view key, std::string_view data) noexcept {
-        unsigned char digest[SHA256_DIGEST_LENGTH];
-        unsigned int  len = 0U;
-        HMAC(EVP_sha256(), key.data(), static_cast<int>(key.size()),
-             reinterpret_cast<const unsigned char*>(data.data()), data.size(), digest, &len);
-        static constexpr char k_hex[] = "0123456789abcdef";
-        std::string out(SHA256_DIGEST_LENGTH * 2U, '\0');
-        for (unsigned int i = 0U; i < len; ++i) {
-            out[i*2U]   = k_hex[(digest[i] >> 4U) & 0xFU];
-            out[i*2U+1U]= k_hex[digest[i] & 0xFU];
-        }
-        return out;
-    }
-
-    // Формирование JSON для WebSocket API
-    [[nodiscard]] inline std::string build_ws_order_msg(
-        std::uint64_t msg_id, std::string_view symbol, std::string_view side, float qty,
-        std::string_view api_key, std::string_view api_secret, std::uint64_t ts_ms)
-    {
-        int precision = (symbol == "BTCUSDT" || symbol == "ETHUSDT") ? 3 : (symbol == "BNBUSDT" ? 2 : 0);
-        char qty_buf[32]; char fmt[16];
-        std::snprintf(fmt, sizeof(fmt), "%%.%df", precision);
-        std::snprintf(qty_buf, sizeof(qty_buf), fmt, static_cast<double>(qty));
-
-        std::string payload;
-        payload.reserve(256);
-        payload += "apiKey="; payload += api_key;
-        payload += "&quantity="; payload += qty_buf;
-        payload += "&side="; payload += side;
-        payload += "&symbol="; payload += symbol;
-        payload += "&timestamp="; payload += std::to_string(ts_ms);
-        payload += "&type=MARKET";
-
-        std::string sig = hmac_sha256_hex(api_secret, payload);
-
-        // Собираем итоговый JSON
-        std::string json = R"({"id":")" + std::to_string(msg_id) + R"(","method":"order.place","params":{)";
-        json += R"("apiKey":")" + std::string(api_key) + R"(",)";
-        json += R"("quantity":")" + std::string(qty_buf) + R"(",)";
-        json += R"("side":")" + std::string(side) + R"(",)";
-        json += R"("symbol":")" + std::string(symbol) + R"(",)";
-        json += R"("timestamp":)" + std::to_string(ts_ms) + R"(,)";
-        json += R"("type":"MARKET",)";
-        json += R"("signature":")" + sig + R"("}})";
-        return json;
-    }
+// Passive-side pricing: buy at best bid, sell at best ask — never crosses
+// the spread, which is what makes the GTX (post-only) order valid.
+inline double post_only_price(Side side, double best_bid, double best_ask) noexcept {
+    return side == Side::Buy ? best_bid : best_ask;
 }
 
-class ExecutionEngine final {
+// ---------------------------------------------------------------------------
+// IOrderGateway — thin abstraction over your existing order-send transport
+// (REST or the Binance WS order-entry API). Implement this against whatever
+// you already use to place/cancel orders; the engine only depends on this
+// interface.
+// ---------------------------------------------------------------------------
+class IOrderGateway {
 public:
-    ExecutionEngine(std::string_view api_key, std::string_view api_secret, float max_position_usd, float order_size_usd) noexcept
-        : api_key_{api_key}, api_secret_{api_secret}, max_position_usd_{max_position_usd}, order_size_usd_{order_size_usd}, ioc_{1} {}
+    virtual ~IOrderGateway() = default;
 
-    ~ExecutionEngine() noexcept { stop(); }
+    // Must send timeInForce=GTX (post-only). If the venue rejects it for
+    // crossing the book, that surfaces later as an ORDER_TRADE_UPDATE with
+    // X=REJECTED/EXPIRED via the normal OMS update path — this call itself
+    // only needs to succeed at *sending* the request.
+    virtual asio::awaitable<void> send_limit_post_only(std::string_view client_order_id,
+                                                        std::string_view symbol,
+                                                        Side side,
+                                                        double price,
+                                                        double qty) = 0;
 
-    void start() {
-        shutdown_.store(false, std::memory_order_release);
-        // Запускаем фоновый поток, который будет крутить корутины Asio
-        worker_ = std::thread([this]() {
-            boost::asio::co_spawn(ioc_, ws_session(), boost::asio::detached);
-            ioc_.run();
-        });
+    virtual asio::awaitable<void> send_market(std::string_view client_order_id,
+                                               std::string_view symbol,
+                                               Side side,
+                                               double qty) = 0;
+
+    virtual asio::awaitable<void> cancel_order(std::string_view symbol,
+                                                std::string_view client_order_id) = 0;
+};
+
+// ---------------------------------------------------------------------------
+// ExecutionEngine
+// ---------------------------------------------------------------------------
+class ExecutionEngine {
+public:
+    struct ArbLeg {
+        std::string symbol;
+        Side side;
+        double qty;
+        double price;  // best bid (Buy) or best ask (Sell) at signal time
+    };
+
+    ExecutionEngine(asio::any_io_executor exec, OMSCore& oms, IOrderGateway& gateway)
+        : exec_(exec), oms_(oms), gateway_(gateway) {
+        oms_.set_update_callback([this](const OrderRecord& rec) { dispatch_update(rec); });
     }
 
-    void stop() noexcept {
-        shutdown_.store(true, std::memory_order_release);
-        ioc_.stop();
-        if (worker_.joinable()) worker_.join();
-    }
+    // Entry point called by your signal generator. Registers both legs in
+    // the OMS, creates per-order waiter channels *before* sending (a fill
+    // can race back on the user-data stream before send_* even returns),
+    // fires both GTX orders, then hands off monitoring to a detached
+    // coroutine so the signal-processing loop is not blocked on the
+    // outcome of this pair.
+    asio::awaitable<void> on_signal(ArbLeg leg1, ArbLeg leg2) {
+        const std::string id1 = next_client_id();
+        const std::string id2 = next_client_id();
+        const uint64_t key1 = fnv1a64(id1);
+        const uint64_t key2 = fnv1a64(id2);
 
-    void submit(const RoutedEdge& edge, float mid_src, float mid_dst) noexcept {
-        if (shutdown_.load(std::memory_order_relaxed)) return;
+        oms_.register_new_order(id1, leg1.symbol, leg1.side, leg1.price, leg1.qty);
+        oms_.register_new_order(id2, leg2.symbol, leg2.side, leg2.price, leg2.qty);
 
-        // Лимиты по позициям
-        const float cur = positions_[edge.src_instrument].net_qty.load(std::memory_order_relaxed);
-        if (std::abs(cur) * mid_src > max_position_usd_) return;
+        auto chan1 = get_or_create_waiter(key1);
+        auto chan2 = get_or_create_waiter(key2);
 
-        const float qty_src = order_size_usd_ / (mid_src > 0.0F ? mid_src : 1.0F);
-        const float qty_dst = order_size_usd_ / (mid_dst > 0.0F ? mid_dst : 1.0F);
-        const bool  long_s  = edge.harmonic_flow > 0.0F;
+        co_await gateway_.send_limit_post_only(id1, leg1.symbol, leg1.side, leg1.price, leg1.qty);
+        co_await gateway_.send_limit_post_only(id2, leg2.symbol, leg2.side, leg2.price, leg2.qty);
 
-        const std::uint64_t ts_ms = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
-
-        // Формируем JSON ордера на покупку
-        std::uint64_t id1 = msg_id_.fetch_add(1, std::memory_order_relaxed);
-        std::string msg_src = detail::build_ws_order_msg(id1, k_symbols_upper[edge.src_instrument], long_s ? "BUY" : "SELL", qty_src, api_key_, api_secret_, ts_ms);
-
-        // Формируем JSON ордера на продажу
-        std::uint64_t id2 = msg_id_.fetch_add(1, std::memory_order_relaxed);
-        std::string msg_dst = detail::build_ws_order_msg(id2, k_symbols_upper[edge.dst_instrument], long_s ? "SELL" : "BUY", qty_dst, api_key_, api_secret_, ts_ms + 1U);
-
-        metrics_.orders_submitted.fetch_add(2U, std::memory_order_relaxed);
-
-        // Асинхронно кидаем в очередь (Zero Blocking для GPU!)
-        boost::asio::post(ioc_, [this, m1 = std::move(msg_src), m2 = std::move(msg_dst)]() mutable {
-            write_queue_.push_back(std::move(m1));
-            write_queue_.push_back(std::move(m2));
-            if (!is_writing_ && ws_connected_) do_write();
-        });
-
-        // Считаем Paper PnL
-        update_paper_position(edge.src_instrument, qty_src, mid_src, long_s);
-        update_paper_position(edge.dst_instrument, qty_dst, mid_dst, !long_s);
-    }
-
-    [[nodiscard]] const ExecutionMetrics& metrics() const noexcept { return metrics_; }
-
-    void print_risk_summary() const noexcept {
-        std::printf("  ── Execution Engine Risk Summary ──\n");
-        std::printf("  Orders submitted : %llu\n", (unsigned long long)metrics_.orders_submitted.load());
-        std::printf("  Orders filled    : %llu\n", (unsigned long long)metrics_.orders_filled.load());
-        std::printf("  Orders rejected  : %llu\n", (unsigned long long)metrics_.orders_rejected.load());
-        std::printf("  WS disconnects   : %llu\n", (unsigned long long)metrics_.http_errors.load());
-        std::printf("  Realized PnL     : %.4f USD\n", static_cast<double>(metrics_.total_pnl.load()));
+        asio::co_spawn(exec_,
+                        monitor_pair(id1, leg1, chan1, id2, leg2, chan2),
+                        asio::detached);
     }
 
 private:
-    // Главная корутина: поддерживает соединение с биржей
-    boost::asio::awaitable<void> ws_session() {
-        namespace beast = boost::beast; namespace websocket = beast::websocket;
-        namespace asio = boost::asio; namespace ssl = asio::ssl;
-        auto executor = co_await asio::this_coro::executor;
+    static constexpr auto kLegTimeout = std::chrono::milliseconds(50);
+    using Chan = asio::experimental::channel<void(boost::system::error_code, OrderRecord)>;
 
-        while (!shutdown_.load(std::memory_order_relaxed)) {
-            try {
-                ssl::context ssl_ctx{ssl::context::tlsv12_client};
-                ssl_ctx.set_default_verify_paths();
-                asio::ip::tcp::resolver resolver{executor};
-                auto const results = co_await resolver.async_resolve(std::string{k_binance_futures_ws_host}, std::string{k_binance_futures_ws_port}, asio::use_awaitable);
+    // -- Legging risk manager -------------------------------------------------
+    asio::awaitable<void> monitor_pair(std::string id1, ArbLeg leg1, std::shared_ptr<Chan> chan1,
+                                        std::string id2, ArbLeg leg2, std::shared_ptr<Chan> chan2) {
+        using namespace boost::asio::experimental::awaitable_operators;
 
-                ws_ = std::make_unique<websocket::stream<beast::ssl_stream<beast::tcp_stream>>>(executor, ssl_ctx);
-                if (!SSL_set_tlsext_host_name(ws_->next_layer().native_handle(), k_binance_futures_ws_host.data())) throw std::runtime_error("SNI Failed");
+        const uint64_t key1 = fnv1a64(id1);
+        const uint64_t key2 = fnv1a64(id2);
 
-                co_await beast::get_lowest_layer(*ws_).async_connect(results, asio::use_awaitable);
-                co_await ws_->next_layer().async_handshake(ssl::stream_base::client, asio::use_awaitable);
-                co_await ws_->async_handshake(std::string{k_binance_futures_ws_host}, std::string{k_binance_futures_ws_path}, asio::use_awaitable);
+        // Wait for either leg to reach a terminal state (Filled, or
+        // Canceled/Rejected e.g. a GTX post-only reject).
+        auto first = co_await (wait_for_terminal_or_filled(chan1) ||
+                                wait_for_terminal_or_filled(chan2));
 
-                ws_connected_ = true;
-                if (!write_queue_.empty() && !is_writing_) do_write();
+        OrderRecord first_rec;
+        std::shared_ptr<Chan> resting_chan;
+        std::string resting_id;
+        ArbLeg resting_leg;
+        uint64_t resting_key;
 
-                // Вечный цикл чтения ответов от биржи
-                beast::flat_buffer buf;
-                while (!shutdown_.load(std::memory_order_relaxed)) {
-                    co_await ws_->async_read(buf, asio::use_awaitable);
-                    std::string_view response{static_cast<const char*>(buf.data().data()), buf.data().size()};
-
-                    // Парсинг ответа
-                    if (response.find(R"("code":)") != std::string_view::npos && response.find(R"("code":200)") == std::string_view::npos) {
-                        metrics_.orders_rejected.fetch_add(1U, std::memory_order_relaxed);
-                        std::printf("\n[BINANCE WS REJECT] %s\n", std::string(response).c_str());
-                    } else if (response.find(R"("id":)") != std::string_view::npos) {
-                        metrics_.orders_filled.fetch_add(1U, std::memory_order_relaxed);
-                    }
-                    buf.consume(buf.size());
-                }
-            } catch (...) {
-                ws_connected_ = false; is_writing_ = false;
-                metrics_.http_errors.fetch_add(1U, std::memory_order_relaxed);
-                // Ждем 2 секунды перед реконнектом
-                asio::steady_timer timer(executor, std::chrono::seconds(2));
-                co_await timer.async_wait(asio::use_awaitable);
-            }
-        }
-    }
-
-    // Асинхронная запись в сокет (выгребает очередь)
-    void do_write() {
-        if (!ws_connected_ || write_queue_.empty()) { is_writing_ = false; return; }
-        is_writing_ = true;
-        ws_->async_write(boost::asio::buffer(write_queue_.front()), [this](boost::beast::error_code ec, std::size_t) {
-            if (!ec) { write_queue_.pop_front(); do_write(); }
-            else { is_writing_ = false; ws_connected_ = false; }
-        });
-    }
-
-    void update_paper_position(std::uint32_t id, float qty, float price, bool is_buy) noexcept {
-        if (id >= k_feed_n_instruments) return;
-        auto& pos = positions_[id];
-        const float sign = is_buy ? 1.0F : -1.0F;
-        const float prev_qty = pos.net_qty.load(std::memory_order_relaxed);
-        const float prev_ep  = pos.avg_entry_price.load(std::memory_order_relaxed);
-        const float new_qty  = prev_qty + sign * qty;
-
-        if (std::abs(new_qty) < 1e-9F) {
-            const float rpnl = prev_qty * (price - prev_ep);
-            pos.realized_pnl.fetch_add(rpnl, std::memory_order_relaxed);
-            metrics_.total_pnl.fetch_add(rpnl, std::memory_order_relaxed);
-            pos.net_qty.store(0.0F, std::memory_order_relaxed);
-        } else if (prev_qty == 0.0F || (prev_qty > 0.0F) == is_buy) {
-            pos.avg_entry_price.store((prev_ep * std::abs(prev_qty) + price * qty) / (std::abs(prev_qty) + qty), std::memory_order_relaxed);
-            pos.net_qty.store(new_qty, std::memory_order_relaxed);
+        if (first.index() == 0) {
+            first_rec = std::get<0>(first);
+            remove_waiter(key1);
+            resting_chan = chan2; resting_id = id2; resting_leg = leg2; resting_key = key2;
         } else {
-            const float closed = std::min(std::abs(prev_qty), qty);
-            const float rpnl = (is_buy ? -1.0F : 1.0F) * closed * (price - prev_ep);
-            pos.realized_pnl.fetch_add(rpnl, std::memory_order_relaxed);
-            metrics_.total_pnl.fetch_add(rpnl, std::memory_order_relaxed);
-            pos.net_qty.store(new_qty, std::memory_order_relaxed);
+            first_rec = std::get<1>(first);
+            remove_waiter(key2);
+            resting_chan = chan1; resting_id = id1; resting_leg = leg1; resting_key = key1;
         }
-        pos.n_orders.fetch_add(1U, std::memory_order_relaxed);
+
+        if (first_rec.status != OrderStatus::Filled) {
+            // First leg to settle was Canceled/Rejected, not Filled — no
+            // exposure was ever taken, nothing to hedge. Just clean up.
+            remove_waiter(resting_key);
+            co_return;
+        }
+
+        // One leg is confirmed filled. Give the other leg kLegTimeout to
+        // fill naturally before intervening.
+        asio::steady_timer timer(exec_);
+        timer.expires_after(kLegTimeout);
+
+        auto race = co_await (wait_for_terminal_or_filled(resting_chan) ||
+                               timer.async_wait(asio::use_awaitable));
+        remove_waiter(resting_key);
+
+        if (race.index() == 0) {
+            const OrderRecord resting_rec = std::get<0>(race);
+            if (resting_rec.status == OrderStatus::Filled) {
+                co_return;  // both legs filled — arb complete, maker fees on both sides
+            }
+            // else: resting leg was Canceled/Rejected on its own (e.g. GTX
+            // reject) — fall through and hedge the exposure from leg 1.
+        }
+        // else: 50ms elapsed with the resting leg still live — intervene.
+
+        auto rec = oms_.get(resting_key);
+        if (!rec) co_return;  // shouldn't happen, but nothing to act on
+
+        const double remaining = rec->remaining_qty();
+
+        if (is_live(rec->status)) {
+            co_await gateway_.cancel_order(resting_leg.symbol, resting_id);
+        }
+
+        if (remaining > 1e-12) {
+            const std::string hedge_id = next_client_id();
+            oms_.register_new_order(hedge_id, resting_leg.symbol, resting_leg.side, 0.0, remaining);
+            co_await gateway_.send_market(hedge_id, resting_leg.symbol, resting_leg.side, remaining);
+        }
     }
 
-    const std::string api_key_;
-    const std::string api_secret_;
-    const float       max_position_usd_;
-    const float       order_size_usd_;
-    std::atomic<bool>       shutdown_{false};
-    boost::asio::io_context ioc_;
-    boost::asio::executor_work_guard<boost::asio::io_context::executor_type> work_{boost::asio::make_work_guard(ioc_)};
-    std::thread             worker_;
-    std::unique_ptr<boost::beast::websocket::stream<boost::beast::ssl_stream<boost::beast::tcp_stream>>> ws_;
-    bool ws_connected_{false};
-    bool is_writing_{false};
-    std::deque<std::string> write_queue_;
-    std::atomic<std::uint64_t> msg_id_{1};
-    std::array<PaperPosition, k_feed_n_instruments> positions_{};
-    ExecutionMetrics metrics_;
+    // Suspends until the given order's channel delivers a terminal update
+    // (Filled, Canceled, or Rejected).
+    asio::awaitable<OrderRecord> wait_for_terminal_or_filled(std::shared_ptr<Chan> chan) {
+        for (;;) {
+            auto rec = co_await chan->async_receive(asio::use_awaitable);
+            if (is_terminal(rec.status)) co_return rec;
+        }
+    }
+
+    // -- Waiter registry --------------------------------------------------
+    // One-shot pub/sub: each in-flight order gets its own channel so that
+    // multiple concurrently-monitored pairs never race over a shared
+    // stream. dispatch_update() is invoked from OMSCore's update callback,
+    // which — since updates originate from UserDataFeed's read loop — may
+    // run on a different strand/thread than the monitor coroutines; the
+    // registry is therefore mutex-protected.
+    std::shared_ptr<Chan> get_or_create_waiter(uint64_t key) {
+        std::lock_guard lk(waiters_mtx_);
+        auto [it, inserted] = waiters_.try_emplace(key, nullptr);
+        if (inserted) it->second = std::make_shared<Chan>(exec_, /*max_buffer=*/4);
+        return it->second;
+    }
+
+    void remove_waiter(uint64_t key) {
+        std::lock_guard lk(waiters_mtx_);
+        waiters_.erase(key);
+    }
+
+    void dispatch_update(const OrderRecord& rec) {
+        const uint64_t key = fnv1a64(view(rec.client_order_id));
+        std::shared_ptr<Chan> chan;
+        {
+            std::lock_guard lk(waiters_mtx_);
+            auto it = waiters_.find(key);
+            if (it != waiters_.end()) chan = it->second;
+        }
+        // Non-blocking: a full channel silently drops (max_buffer=4 is far
+        // more than one order should ever need); this callback must never
+        // block the caller (the UserDataFeed read loop).
+        if (chan) chan->try_send(boost::system::error_code{}, rec);
+    }
+
+    std::string next_client_id() {
+        return "holo-" + std::to_string(seq_.fetch_add(1, std::memory_order_relaxed));
+    }
+
+    asio::any_io_executor exec_;
+    OMSCore& oms_;
+    IOrderGateway& gateway_;
+    std::atomic<uint64_t> seq_{0};
+
+    std::mutex waiters_mtx_;
+    std::unordered_map<uint64_t, std::shared_ptr<Chan>> waiters_;
 };
 
-} // namespace holo::net
+}  // namespace holo::net
