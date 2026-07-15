@@ -15,7 +15,7 @@ namespace holo::net
 {
 
 static constexpr std::size_t k_signal_router_top_k = 3U;
-static constexpr float       k_signal_min_curl = 0.002F;
+static constexpr float       k_signal_min_curl = 35.0F;
 
 struct alignas(32) RoutedEdge
 {
@@ -37,6 +37,8 @@ struct alignas(64) RouterMetrics
     std::byte _pad[64U - 3U * sizeof(std::atomic<std::uint64_t>)]{};
 };
 static_assert(sizeof(RouterMetrics) == 64U);
+
+static float active_threshold() noexcept { if (const char* env = std::getenv("HOLO_THRESHOLD")) return std::strtof(env, nullptr); return 10.0f; }
 
 class SignalRouter final
 {
@@ -60,7 +62,7 @@ public:
     {
         metrics_.signals_processed.fetch_add(1U, std::memory_order_relaxed);
 
-        if (sig.yang_mills_action < k_signal_min_curl)
+        if (sig.yang_mills_action < active_threshold())
         {
             metrics_.signals_suppressed.fetch_add(1U, std::memory_order_relaxed);
             return 0U;
@@ -79,7 +81,7 @@ public:
         for (std::size_t e = 0U; e < n_edges; ++e)
         {
             const float af = (h_curl_flow[e] < 0.0F) ? -h_curl_flow[e] : h_curl_flow[e];
-            if (af < k_signal_min_curl) continue;  // FIX: skip sub-threshold early
+            if (af < active_threshold()) continue;  // FIX: skip sub-threshold early
 
             // Find minimum slot
             std::size_t min_pos = 0U;
@@ -98,7 +100,7 @@ public:
         for (std::size_t t = 0U; t < k_signal_router_top_k; ++t)
         {
             // FIX: skip zero-flow slots (unfilled top-K positions)
-            if (top[t].abs_flow < k_signal_min_curl) break;
+            if (top[t].abs_flow < active_threshold()) break;
 
             const std::size_t e = top[t].idx;
             if (e >= h_edge_src.size()) break;

@@ -30,7 +30,6 @@
 namespace holo::net
 {
 
-// Эндпоинты для WebSocket Binance Futures Testnet
 static constexpr std::string_view k_binance_futures_ws_host = "testnet.binancefuture.com";
 static constexpr std::string_view k_binance_futures_ws_port = "443";
 static constexpr std::string_view k_binance_futures_ws_path = "/ws-fapi/v1";
@@ -53,7 +52,6 @@ struct alignas(64) ExecutionMetrics {
 };
 
 namespace detail {
-    // Криптография для подписи ордера (HMAC SHA256)
     [[nodiscard]] inline std::string hmac_sha256_hex(std::string_view key, std::string_view data) noexcept {
         unsigned char digest[SHA256_DIGEST_LENGTH];
         unsigned int  len = 0U;
@@ -68,7 +66,6 @@ namespace detail {
         return out;
     }
 
-    // Формирование JSON для WebSocket API
     [[nodiscard]] inline std::string build_ws_order_msg(
         std::uint64_t msg_id, std::string_view symbol, std::string_view side, float qty,
         std::string_view api_key, std::string_view api_secret, std::uint64_t ts_ms)
@@ -89,7 +86,6 @@ namespace detail {
 
         std::string sig = hmac_sha256_hex(api_secret, payload);
 
-        // Собираем итоговый JSON
         std::string json = R"({"id":")" + std::to_string(msg_id) + R"(","method":"order.place","params":{)";
         json += R"("apiKey":")" + std::string(api_key) + R"(",)";
         json += R"("quantity":")" + std::string(qty_buf) + R"(",)";
@@ -111,7 +107,6 @@ public:
 
     void start() {
         shutdown_.store(false, std::memory_order_release);
-        // Запускаем фоновый поток, который будет крутить корутины Asio
         worker_ = std::thread([this]() {
             boost::asio::co_spawn(ioc_, ws_session(), boost::asio::detached);
             ioc_.run();
@@ -126,8 +121,8 @@ public:
 
     void submit(const RoutedEdge& edge, float mid_src, float mid_dst) noexcept {
         if (shutdown_.load(std::memory_order_relaxed)) return;
+        if (edge.src_instrument >= k_feed_n_instruments || edge.dst_instrument >= k_feed_n_instruments) return;
 
-        // Лимиты по позициям
         const float cur = positions_[edge.src_instrument].net_qty.load(std::memory_order_relaxed);
         if (std::abs(cur) * mid_src > max_position_usd_) return;
 
@@ -137,24 +132,20 @@ public:
 
         const std::uint64_t ts_ms = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
 
-        // Формируем JSON ордера на покупку
         std::uint64_t id1 = msg_id_.fetch_add(1, std::memory_order_relaxed);
         std::string msg_src = detail::build_ws_order_msg(id1, k_symbols_upper[edge.src_instrument], long_s ? "BUY" : "SELL", qty_src, api_key_, api_secret_, ts_ms);
 
-        // Формируем JSON ордера на продажу
         std::uint64_t id2 = msg_id_.fetch_add(1, std::memory_order_relaxed);
         std::string msg_dst = detail::build_ws_order_msg(id2, k_symbols_upper[edge.dst_instrument], long_s ? "SELL" : "BUY", qty_dst, api_key_, api_secret_, ts_ms + 1U);
 
         metrics_.orders_submitted.fetch_add(2U, std::memory_order_relaxed);
 
-        // Асинхронно кидаем в очередь (Zero Blocking для GPU!)
         boost::asio::post(ioc_, [this, m1 = std::move(msg_src), m2 = std::move(msg_dst)]() mutable {
             write_queue_.push_back(std::move(m1));
             write_queue_.push_back(std::move(m2));
             if (!is_writing_ && ws_connected_) do_write();
         });
 
-        // Считаем Paper PnL
         update_paper_position(edge.src_instrument, qty_src, mid_src, long_s);
         update_paper_position(edge.dst_instrument, qty_dst, mid_dst, !long_s);
     }
@@ -171,13 +162,13 @@ public:
     }
 
 private:
-    // Главная корутина: поддерживает соединение с биржей
     boost::asio::awaitable<void> ws_session() {
         namespace beast = boost::beast; namespace websocket = beast::websocket;
         namespace asio = boost::asio; namespace ssl = asio::ssl;
         auto executor = co_await asio::this_coro::executor;
 
         while (!shutdown_.load(std::memory_order_relaxed)) {
+            bool connection_error = false;
             try {
                 ssl::context ssl_ctx{ssl::context::tlsv12_client};
                 ssl_ctx.set_default_verify_paths();
@@ -194,13 +185,11 @@ private:
                 ws_connected_ = true;
                 if (!write_queue_.empty() && !is_writing_) do_write();
 
-                // Вечный цикл чтения ответов от биржи
                 beast::flat_buffer buf;
                 while (!shutdown_.load(std::memory_order_relaxed)) {
                     co_await ws_->async_read(buf, asio::use_awaitable);
                     std::string_view response{static_cast<const char*>(buf.data().data()), buf.data().size()};
 
-                    // Парсинг ответа
                     if (response.find(R"("code":)") != std::string_view::npos && response.find(R"("code":200)") == std::string_view::npos) {
                         metrics_.orders_rejected.fetch_add(1U, std::memory_order_relaxed);
                         std::printf("\n[BINANCE WS REJECT] %s\n", std::string(response).c_str());
@@ -212,19 +201,22 @@ private:
             } catch (...) {
                 ws_connected_ = false; is_writing_ = false;
                 metrics_.http_errors.fetch_add(1U, std::memory_order_relaxed);
-                // Ждем 2 секунды перед реконнектом
+                connection_error = true;
+            }
+
+            // Вынесли ожидание за пределы блока catch (требование C++20)
+            if (connection_error) {
                 asio::steady_timer timer(executor, std::chrono::seconds(2));
                 co_await timer.async_wait(asio::use_awaitable);
             }
         }
     }
 
-    // Асинхронная запись в сокет (выгребает очередь)
     void do_write() {
         if (!ws_connected_ || write_queue_.empty()) { is_writing_ = false; return; }
         is_writing_ = true;
         ws_->async_write(boost::asio::buffer(write_queue_.front()), [this](boost::beast::error_code ec, std::size_t) {
-            if (!ec) { write_queue_.pop_front(); do_write(); }
+            if (!ec) { write_queue_.pop_front(); do_write(); } 
             else { is_writing_ = false; ws_connected_ = false; }
         });
     }
@@ -250,14 +242,6 @@ private:
             const float rpnl = (is_buy ? -1.0F : 1.0F) * closed * (price - prev_ep);
             pos.realized_pnl.fetch_add(rpnl, std::memory_order_relaxed);
             metrics_.total_pnl.fetch_add(rpnl, std::memory_order_relaxed);
-
-            // FIX: if this fill fully closes the old side AND opens a new
-            // position in the opposite direction ("flip"), the residual
-            // quantity's cost basis is the CURRENT fill price — not the
-            // old position's entry price. Previously avg_entry_price was
-            // left untouched here, so it silently carried over from the
-            // just-closed opposite-sign position and corrupted every
-            // subsequent realized-PnL calculation for this instrument.
             if (qty > std::abs(prev_qty)) {
                 pos.avg_entry_price.store(price, std::memory_order_relaxed);
             }
