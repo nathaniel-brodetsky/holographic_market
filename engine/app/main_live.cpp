@@ -15,6 +15,7 @@
 #include <string>
 #include <vector>
 #include <chrono>
+#include <iomanip>
 
 #include <boost/asio.hpp>
 #include <boost/beast.hpp>
@@ -75,6 +76,9 @@ int main() {
     std::string api_key = "ВАШ_API_КЛЮЧ_ЗДЕСЬ";
     std::string api_secret = "ВАШ_СЕКРЕТНЫЙ_КЛЮЧ_ЗДЕСЬ";
 
+    const double order_size_usd = 100.0;
+    const double max_position_usd = 100'000.0;
+
     std::cout << "========================================================\n";
     std::cout << "  HOLOGRAPHIC MARKET ARCHITECTURE  v2.0 (Maker OMS)\n";
     std::cout << "========================================================\n";
@@ -90,7 +94,6 @@ int main() {
     std::cout << "[INFO] Market data feed started. Warming up (2s)...\n";
     std::this_thread::sleep_for(std::chrono::seconds(2));
 
-    // Drain ring buffer to initialize LOB
     holo::core::LobUpdate u{};
     while (ring_ptr->try_pop(u)) {
         lob_ptr->apply(u);
@@ -107,20 +110,23 @@ int main() {
     std::string listen_key;
     try {
         listen_key = fetch_listen_key(api_key);
-        std::cout << "[INFO] ListenKey acquired: " << listen_key << "\n";
+        std::cout << "[INFO] ListenKey acquired.\n";
     } catch (const std::exception& e) {
         std::cerr << "[ERROR] Could not fetch ListenKey: " << e.what() << "\n";
         return 1;
     }
 
     OMSCore oms;
-    UserDataFeed ud_feed(ioc.get_executor(), ssl_ctx, "testnet.binancefuture.com", listen_key, oms);
-    ud_feed.start(ioc.get_executor());
 
-    BinanceGateway gateway(ioc.get_executor(), ssl_ctx, api_key, api_secret);
+    // UserDataFeed (Слушает исполнение ордеров по WebSocket)
+    UserDataFeed ud_feed(ioc.get_executor(), ssl_ctx, "testnet.binancefuture.com", listen_key, oms);
+    ud_feed.start();
+
+    // Шлюз отправки ордеров по WebSocket
+    BinanceGateway gateway(ioc.get_executor(), ssl_ctx, api_key, api_secret, oms);
     gateway.start();
 
-    // Передаем OMS и шлюз в ExecutionEngine
+    // Мозг: Execution Engine
     ExecutionEngine exec(ioc.get_executor(), oms, gateway);
 
     // --- 6. BACKGROUND THREADS ---
@@ -137,6 +143,21 @@ int main() {
                 lob_ptr->apply(u);
             }
             std::this_thread::sleep_for(std::chrono::microseconds(200));
+        }
+    }};
+
+    // Фоновый поток для логирования профита раз в 5 секунд
+    std::thread pnl_logger_thread{[&]() {
+        while(!shutdown.load(std::memory_order_relaxed)) {
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+            double total = exec.pnl().total_pnl([&](std::string_view sym) {
+                if (sym == "BTCUSDT") return lob_ptr->mid_price(0);
+                if (sym == "ETHUSDT") return lob_ptr->mid_price(1);
+                if (sym == "SOLUSDT") return lob_ptr->mid_price(2);
+                if (sym == "BNBUSDT") return lob_ptr->mid_price(3);
+                return 0.0f;
+            });
+            std::cout << "\n[PNL] Live MTM PnL (Realized + Unrealized): " << std::fixed << std::setprecision(4) << total << " USD | Live Orders in Book: " << oms.live_order_count() << "\n";
         }
     }};
 
@@ -166,26 +187,32 @@ int main() {
                     const auto& edge = edges[i];
                     bool is_long = edge.harmonic_flow > 0.0f;
 
-                    // Нога 1 (Встаем лимиткой в Best Bid или Best Ask)
+                    std::string sym1 = std::string(k_symbols_upper[edge.src_instrument]);
+                    std::string sym2 = std::string(k_symbols_upper[edge.dst_instrument]);
+
+                    // Проверяем лимиты риска из PnlBook от Claude
+                    double cur_pos1_qty = std::abs(exec.pnl().snapshot(sym1).qty);
+                    if (cur_pos1_qty * lob_ptr->mid_price(edge.src_instrument) > max_position_usd) continue;
+
+                    // Нога 1 (Лимитка в спред)
                     ExecutionEngine::ArbLeg leg1{
-                        std::string(k_symbols_upper[edge.src_instrument]),
+                        sym1,
                         is_long ? holo::net::Side::Buy : holo::net::Side::Sell,
-                        100.0 / lob_ptr->mid_price(edge.src_instrument), // Позиция на $100
+                        order_size_usd / lob_ptr->mid_price(edge.src_instrument),
                         is_long ? lob_ptr->best_bid(edge.src_instrument) : lob_ptr->best_ask(edge.src_instrument)
                     };
 
-                    // Нога 2 (Зеркально)
+                    // Нога 2 (Зеркальная лимитка)
                     ExecutionEngine::ArbLeg leg2{
-                        std::string(k_symbols_upper[edge.dst_instrument]),
+                        sym2,
                         is_long ? holo::net::Side::Sell : holo::net::Side::Buy,
-                        100.0 / lob_ptr->mid_price(edge.dst_instrument), // Позиция на $100
+                        order_size_usd / lob_ptr->mid_price(edge.dst_instrument),
                         is_long ? lob_ptr->best_ask(edge.dst_instrument) : lob_ptr->best_bid(edge.dst_instrument)
                     };
 
-                    std::cout << "\n[SIGNAL] Curl=" << edge.harmonic_flow
-                              << " | Placing Maker Limits for " << leg1.symbol << " & " << leg2.symbol << "\n";
+                    std::cout << "[SIGNAL] S_YM=" << sig.yang_mills_action << " | Placing Maker Limits for " << leg1.symbol << " & " << leg2.symbol << "\n";
 
-                    // Запускаем корутину контроля рисков (Legging Risk Manager)
+                    // Запускаем корутину
                     boost::asio::co_spawn(ioc, exec.on_signal(leg1, leg2), boost::asio::detached);
                 }
             }
@@ -195,6 +222,7 @@ int main() {
     shutdown = true;
     pipeline_thread.join();
     drain_thread.join();
+    pnl_logger_thread.join();
     ioc.stop();
     asio_thread.join();
 

@@ -6,8 +6,8 @@
 // Maintains a persistent wss connection to wss://<host>/ws/<listenKey>,
 // parses ORDER_TRADE_UPDATE events, and pushes state transitions into
 // OMSCore. Assumes the listenKey has already been obtained (and is kept
-// alive) via the REST layer elsewhere in your codebase — this module only
-// consumes the stream.
+// alive via a periodic PUT /fapi/v1/listenKey) via the REST layer
+// elsewhere in your codebase — this module only consumes the stream.
 //
 // JSON parsing uses simdjson::dom::parser. dom::parser owns and reuses its
 // internal padded buffer across parse() calls, so steady-state message
@@ -16,6 +16,16 @@
 // fields are accessed out of declaration order below, which ondemand's
 // forward-only cursor does not support without extra bookkeeping.
 //
+// RECONNECTION: start() runs an outer backoff loop around run(). Binance
+// will also proactively close the stream (or send `listenKeyExpired`) if
+// the listenKey isn't refreshed — that path logs and returns from run(),
+// which the backoff loop will then retry. A stale listenKey after
+// reconnect will fail the handshake with an HTTP error, which propagates
+// as an exception out of run() and is likewise handled by the backoff
+// loop. If your listenKey-refresh lives in a different component, make
+// sure it's refreshing on its own timer independent of this reconnect
+// loop (do not couple listenKey refresh to WS reconnect attempts).
+//
 #include "oms_core.hpp"
 
 #include <boost/asio/awaitable.hpp>
@@ -23,6 +33,7 @@
 #include <boost/asio/detached.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/ssl.hpp>
+#include <boost/asio/steady_timer.hpp>
 #include <boost/asio/use_awaitable.hpp>
 #include <boost/beast/core.hpp>
 #include <boost/beast/ssl.hpp>
@@ -31,6 +42,7 @@
 
 #include <simdjson.h>
 
+#include <algorithm>
 #include <charconv>
 #include <iostream>
 #include <string>
@@ -49,79 +61,123 @@ public:
                  std::string host,
                  std::string listen_key,
                  OMSCore& oms)
-        : resolver_(exec)
-        , ws_(exec, ssl_ctx)
+        : exec_(exec)
+        , ssl_ctx_(ssl_ctx)
         , host_(std::move(host))
         , listen_key_(std::move(listen_key))
         , oms_(oms) {}
 
-    // Fire-and-forget launch. On unrecoverable error the coroutine
-    // completes and the exception is logged here; wire your own
-    // reconnect/backoff loop around start() if you want auto-reconnect
-    // (recommended: also refresh the listenKey via REST on reconnect).
-    void start(asio::any_io_executor exec) {
-        asio::co_spawn(exec, run(), [](std::exception_ptr e) {
+    // Fire-and-forget launch with exponential backoff reconnect. Runs
+    // until the process exits; there is no clean stop() because in
+    // practice you want this feed alive for the process lifetime (an OMS
+    // with a dead user-data feed is silently blind to fills — better to
+    // crash-and-restart the whole process via your supervisor than to
+    // limp along without it).
+    void start() {
+        asio::co_spawn(exec_, run_with_backoff(), [](std::exception_ptr e) {
             if (!e) return;
             try {
                 std::rethrow_exception(e);
             } catch (const std::exception& ex) {
-                std::cerr << "[UserDataFeed] fatal: " << ex.what() << "\n";
+                std::cerr << "[UserDataFeed] fatal, backoff loop itself threw: " << ex.what() << "\n";
             }
         });
     }
 
+    // Update the listenKey used on the *next* reconnect. Does not affect
+    // an already-established connection (Binance streams are bound to the
+    // listenKey at handshake time; to rotate mid-flight you must
+    // reconnect, which the backoff loop will do naturally on the next
+    // disconnect — or call force_reconnect() below).
+    void set_listen_key(std::string key) { listen_key_ = std::move(key); }
+
+private:
+    asio::awaitable<void> run_with_backoff() {
+        auto backoff = std::chrono::milliseconds(200);
+        constexpr auto kMaxBackoff = std::chrono::milliseconds(10'000);
+
+        for (;;) {
+            try {
+                co_await run();
+                // run() only returns normally on listenKeyExpired or a
+                // clean server close; treat both as "reconnect promptly."
+                backoff = std::chrono::milliseconds(200);
+            } catch (const std::exception& ex) {
+                std::cerr << "[UserDataFeed] connection error: " << ex.what()
+                          << " — reconnecting in " << backoff.count() << "ms\n";
+            }
+
+            asio::steady_timer t(exec_);
+            t.expires_after(backoff);
+            co_await t.async_wait(asio::use_awaitable);
+            backoff = std::min(backoff * 2, kMaxBackoff);
+        }
+    }
+
     asio::awaitable<void> run() {
-        auto const results = co_await resolver_.async_resolve(host_, "443", asio::use_awaitable);
+        // A fresh stream per connection attempt — beast websocket streams
+        // are not meant to be reused/re-handshaken after a failed or
+        // closed connection.
+        websocket::stream<beast::ssl_stream<beast::tcp_stream>> ws(exec_, ssl_ctx_);
+        tcp::resolver resolver(exec_);
 
-        beast::get_lowest_layer(ws_).expires_after(std::chrono::seconds(30));
-        co_await beast::get_lowest_layer(ws_).async_connect(results, asio::use_awaitable);
+        auto const results = co_await resolver.async_resolve(host_, "443", asio::use_awaitable);
 
-        if (!SSL_set_tlsext_host_name(ws_.next_layer().native_handle(), host_.c_str())) {
+        beast::get_lowest_layer(ws).expires_after(std::chrono::seconds(30));
+        co_await beast::get_lowest_layer(ws).async_connect(results, asio::use_awaitable);
+
+        if (!SSL_set_tlsext_host_name(ws.next_layer().native_handle(), host_.c_str())) {
             throw beast::system_error(beast::error_code(
                 static_cast<int>(::ERR_get_error()), asio::error::get_ssl_category()));
         }
 
-        beast::get_lowest_layer(ws_).expires_after(std::chrono::seconds(30));
-        co_await ws_.next_layer().async_handshake(asio::ssl::stream_base::client,
-                                                    asio::use_awaitable);
+        beast::get_lowest_layer(ws).expires_after(std::chrono::seconds(30));
+        co_await ws.next_layer().async_handshake(asio::ssl::stream_base::client,
+                                                   asio::use_awaitable);
 
-        beast::get_lowest_layer(ws_).expires_never();
-        ws_.set_option(websocket::stream_base::timeout::suggested(beast::role_type::client));
-        ws_.set_option(websocket::stream_base::decorator([](websocket::request_type& req) {
+        beast::get_lowest_layer(ws).expires_never();
+        ws.set_option(websocket::stream_base::timeout::suggested(beast::role_type::client));
+        ws.set_option(websocket::stream_base::decorator([](websocket::request_type& req) {
             req.set(beast::http::field::user_agent, "holo-oms/1.0");
         }));
 
         const std::string target = "/ws/" + listen_key_;
-        co_await ws_.async_handshake(host_, target, asio::use_awaitable);
+        co_await ws.async_handshake(host_, target, asio::use_awaitable);
         std::cerr << "[UserDataFeed] connected: " << target << "\n";
 
         beast::flat_buffer buffer;
         for (;;) {
             buffer.clear();
-            co_await ws_.async_read(buffer, asio::use_awaitable);
-            handle_message(static_cast<const char*>(buffer.data().data()), buffer.size());
+            co_await ws.async_read(buffer, asio::use_awaitable);
+            if (handle_message(static_cast<const char*>(buffer.data().data()), buffer.size())) {
+                co_return;  // listenKeyExpired — caller's backoff loop will reconnect
+                            // once a fresh listenKey has been set via set_listen_key()
+            }
         }
     }
 
-private:
-    void handle_message(const char* data, size_t len) {
+    // Returns true if the caller should tear down and reconnect (i.e. the
+    // listenKey just expired).
+    bool handle_message(const char* data, size_t len) {
         simdjson::dom::element doc;
         if (auto err = parser_.parse(data, len).get(doc)) {
             std::cerr << "[UserDataFeed] parse error: " << simdjson::error_message(err) << "\n";
-            return;
+            return false;
         }
 
         std::string_view event_type;
-        if (doc["e"].get(event_type)) return;  // no event type -> not an event we handle
+        if (doc["e"].get(event_type)) return false;  // no event type -> not an event we handle
 
         if (event_type == "ORDER_TRADE_UPDATE") {
             simdjson::dom::element o;
             if (!doc["o"].get(o)) handle_order_trade_update(o);
         } else if (event_type == "listenKeyExpired") {
-            std::cerr << "[UserDataFeed] listenKey expired — caller must fetch a fresh "
-                         "key and reconnect.\n";
+            std::cerr << "[UserDataFeed] listenKey expired — reconnecting; make sure your "
+                         "REST layer has already pushed a fresh key via set_listen_key().\n";
+            return true;
         }
         // ACCOUNT_UPDATE, MARGIN_CALL, etc. can be dispatched here as needed.
+        return false;
     }
 
     void handle_order_trade_update(simdjson::dom::element o) {
@@ -137,10 +193,10 @@ private:
         }
 
         std::string_view l_price_str;  // last fill price, absent/"0" if no fill on this event
-        o["L"].get(l_price_str);
+        auto _l_err = o["L"].get(l_price_str); (void)_l_err;
 
         int64_t t_ms = 0;
-        o["T"].get(t_ms);
+        auto _t_err = o["T"].get(t_ms); (void)_t_err;
         const int64_t event_ns = t_ms * 1'000'000;
 
         const double cum_filled = svtod(z_str);
@@ -149,6 +205,11 @@ private:
         const uint64_t key = fnv1a64(client_id);
 
         if (!oms_.apply_update(key, status, cum_filled, last_px, exch_order_id, event_ns)) {
+            // Not necessarily a bug: this fires for any client_order_id
+            // this OMS instance didn't itself register (e.g. an order
+            // placed manually on the exchange UI, or from a previous
+            // process run against the same API key). Downgrade to a
+            // debug-level trace if that's expected in your deployment.
             std::cerr << "[UserDataFeed] update for unknown client_order_id=" << client_id
                       << " (order not registered in this OMS instance)\n";
         }
@@ -169,8 +230,8 @@ private:
         return OrderStatus::Open;
     }
 
-    tcp::resolver resolver_;
-    websocket::stream<beast::ssl_stream<beast::tcp_stream>> ws_;
+    asio::any_io_executor exec_;
+    asio::ssl::context& ssl_ctx_;
     std::string host_;
     std::string listen_key_;
     OMSCore& oms_;

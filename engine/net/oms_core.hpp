@@ -1,7 +1,7 @@
 #pragma once
 //
 // oms_core.hpp
-// holo::net — Order Management System core.
+// holo::net — Order Management System core (state machine).
 //
 // A thread-safe, fixed-capacity order state tracker. Steady-state operation
 // (updating an existing order) performs no heap allocation: records live in
@@ -9,12 +9,18 @@
 // via an integer key (FNV-1a hash of the id string) rather than a string
 // hash/compare on the hot path.
 //
+// Concurrency model: reads take a shared_lock, mutations take a unique_lock.
+// register_new_order / apply_update copy the record out and release the
+// lock *before* invoking the update callback, so a slow subscriber can
+// never block a writer (the UserDataFeed's read loop) or another reader.
+//
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <string_view>
@@ -53,6 +59,10 @@ constexpr bool is_live(OrderStatus s) noexcept {
 
 enum class Side : uint8_t { Buy = 0, Sell = 1 };
 
+constexpr Side opposite(Side s) noexcept { return s == Side::Buy ? Side::Sell : Side::Buy; }
+// Signed direction multiplier: +1 for Buy, -1 for Sell. Used for PnL/position math.
+constexpr double signed_dir(Side s) noexcept { return s == Side::Buy ? 1.0 : -1.0; }
+
 // ---------------------------------------------------------------------------
 // Fixed-width buffers — avoid std::string heap allocation on the hot path.
 // ---------------------------------------------------------------------------
@@ -84,7 +94,8 @@ constexpr uint64_t fnv1a64(std::string_view sv) noexcept {
 }
 
 // ---------------------------------------------------------------------------
-// OrderRecord — POD
+// OrderRecord — POD, trivially copyable (safe to copy out from under the
+// lock and hand to subscribers/coroutines without touching OMSCore again).
 // ---------------------------------------------------------------------------
 struct OrderRecord {
     ClientIdBuf client_order_id{};
@@ -101,13 +112,10 @@ struct OrderRecord {
 
     [[nodiscard]] double remaining_qty() const noexcept { return qty - filled_qty; }
 };
+static_assert(std::is_trivially_copyable_v<OrderRecord>);
 
 // ---------------------------------------------------------------------------
 // OMSCore
-//
-// Concurrency model: reads take a shared_lock, mutations take a unique_lock.
-// The slot pool + free-list means registering/updating orders in steady
-// state does not allocate (growth only occurs past the reserved capacity).
 // ---------------------------------------------------------------------------
 class OMSCore {
 public:
@@ -119,7 +127,7 @@ public:
         free_list_.reserve(reserve_capacity);
     }
 
-    OMSCore(const OMSCore&) = delete;
+    OMSCore(const OMSCore&)            = delete;
     OMSCore& operator=(const OMSCore&) = delete;
 
     // Single-subscriber update callback, fired (outside the lock) whenever
@@ -164,7 +172,11 @@ public:
 
     // Apply an update from the user-data stream / REST ack.
     // `cumulative_filled_qty` is the venue's cumulative fill quantity
-    // (Binance "z"), not an incremental delta.
+    // (Binance "z"), not an incremental delta. Monotonicity of the
+    // (status, filled_qty) pair is the caller's responsibility to reason
+    // about — Binance's user-data stream is itself ordered per-symbol, so
+    // this rarely needs defending against out-of-order delivery, but we
+    // never let filled_qty go backwards on a stale/duplicate event.
     bool apply_update(uint64_t key,
                        OrderStatus new_status,
                        double cumulative_filled_qty,
@@ -180,11 +192,15 @@ public:
             const double prev_notional = rec.avg_fill_price * rec.filled_qty;
             const double delta_qty     = cumulative_filled_qty - rec.filled_qty;
             rec.avg_fill_price = (prev_notional + last_fill_price * delta_qty) / cumulative_filled_qty;
+            rec.filled_qty     = cumulative_filled_qty;
+        } else if (cumulative_filled_qty > rec.filled_qty) {
+            // Status-only progression (e.g. cumulative qty given without a
+            // fill price on this particular event) — still advance qty.
+            rec.filled_qty = cumulative_filled_qty;
         }
-        rec.filled_qty       = cumulative_filled_qty;
-        rec.status           = new_status;
+        rec.status            = new_status;
         rec.exchange_order_id = exchange_order_id;
-        rec.updated_ns        = event_ns;
+        rec.updated_ns         = event_ns;
 
         OrderRecord copy = rec;
         lk.unlock();
@@ -223,13 +239,21 @@ public:
     }
 
     // Release a terminal order's slot for reuse. Call once you're done
-    // consuming a Filled/Canceled/Rejected record (e.g. after logging it).
+    // consuming a Filled/Canceled/Rejected record (e.g. after logging it,
+    // or after the execution engine's monitor coroutine has finished with
+    // it). Failing to call this for terminal orders leaks index_ entries
+    // (not slot memory — slots_ itself never shrinks by design) forever.
     void release(uint64_t key) {
         std::unique_lock lk(mtx_);
         auto it = index_.find(key);
         if (it == index_.end()) return;
         free_list_.push_back(it->second);
         index_.erase(it);
+    }
+
+    [[nodiscard]] size_t live_order_count() const {
+        std::shared_lock lk(mtx_);
+        return index_.size();
     }
 
 private:
