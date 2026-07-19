@@ -16,6 +16,7 @@
 #include <vector>
 #include <chrono>
 #include <iomanip>
+#include <cstdlib>
 
 #include <boost/asio.hpp>
 #include <boost/beast.hpp>
@@ -73,8 +74,20 @@ std::string fetch_listen_key(const std::string& api_key) {
 
 int main() {
     // --- 1. CONFIGURATION ---
-    std::string api_key = "ВАШ_API_КЛЮЧ_ЗДЕСЬ";
-    std::string api_secret = "ВАШ_СЕКРЕТНЫЙ_КЛЮЧ_ЗДЕСЬ";
+    // Credentials must never live in source (they end up in git history and
+    // in every build artifact). Set these in the environment before
+    // starting the process, e.g.:
+    //   export HOLO_API_KEY=...
+    //   export HOLO_API_SECRET=...
+    const char* env_key = std::getenv("HOLO_API_KEY");
+    const char* env_secret = std::getenv("HOLO_API_SECRET");
+    if (!env_key || !env_secret) {
+        std::cerr << "[FATAL] HOLO_API_KEY and HOLO_API_SECRET environment variables must be "
+                     "set (do not hardcode credentials in source).\n";
+        return 1;
+    }
+    std::string api_key = env_key;
+    std::string api_secret = env_secret;
 
     const double order_size_usd = 100.0;
     const double max_position_usd = 100'000.0;
@@ -128,6 +141,7 @@ int main() {
 
     // Мозг: Execution Engine
     ExecutionEngine exec(ioc.get_executor(), oms, gateway);
+    exec.start_stale_order_sweeper();
 
     // --- 6. BACKGROUND THREADS ---
     std::thread asio_thread([&ioc]() {
@@ -182,6 +196,19 @@ int main() {
                     std::span<const int>{topo.edge_dst, (size_t)topo.n_edges},
                     edges
                 );
+
+                // If the engine is halted (circuit breaker) or already at
+                // its concurrent-order ceiling, on_signal() would drop
+                // every one of these anyway (and already logs a throttled
+                // reason for it). Skip the per-edge work, the mid-price
+                // lookups, and — most importantly — the "[SIGNAL] Placing
+                // Maker Limits" print entirely in that case: printing
+                // "Placing" for something that is guaranteed to be dropped
+                // is exactly what made the earlier logs look like orders
+                // were going out while the whole engine was blocked.
+                if (exec.is_halted() || exec.is_at_capacity()) {
+                    continue;
+                }
 
                 for (size_t i = 0; i < n_routed; ++i) {
                     const auto& edge = edges[i];

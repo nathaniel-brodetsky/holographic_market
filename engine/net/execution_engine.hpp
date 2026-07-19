@@ -74,11 +74,14 @@
 
 #include <atomic>
 #include <cmath>
+#include <cstdio>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace holo::net {
 
@@ -176,6 +179,14 @@ public:
         pos.qty = new_qty;
     }
 
+    // Fees are a straight debit against realized PnL for that symbol —
+    // there is no "position" concept for a fee, just a cost.
+    void apply_commission(std::string_view symbol, double commission) {
+        if (commission <= 0.0) return;
+        std::lock_guard lk(mtx_);
+        book_[std::string(symbol)].realized_pnl -= commission;
+    }
+
     [[nodiscard]] Position snapshot(std::string_view symbol) const {
         std::lock_guard lk(mtx_);
         auto it = book_.find(std::string(symbol));
@@ -215,9 +226,24 @@ public:
         double price;  // best bid (Buy) or best ask (Sell) at signal time
     };
 
-    ExecutionEngine(asio::any_io_executor exec, OMSCore& oms, IOrderGateway& gateway)
-        : exec_(exec), oms_(oms), gateway_(gateway) {
+    ExecutionEngine(asio::any_io_executor exec, OMSCore& oms, IOrderGateway& gateway,
+                     std::size_t max_open_orders = 40)
+        : exec_(exec), oms_(oms), gateway_(gateway), max_open_orders_(max_open_orders) {
         oms_.set_update_callback([this](const OrderRecord& rec) { dispatch_update(rec); });
+    }
+
+    // -- Circuit breaker ----------------------------------------------------
+    // Trips (halts all new signal processing) after kMaxConsecutiveRejects
+    // Rejected orders in a row with no successful Open/Filled in between —
+    // e.g. a stuck margin/precision/rate-limit condition that would
+    // otherwise cause on_signal() to keep firing orders that all bounce.
+    // Does NOT auto-clear: a human must look at *why* before re-arming.
+    [[nodiscard]] bool is_halted() const noexcept { return halted_.load(std::memory_order_acquire); }
+    void reset_halt() {
+        halted_.store(false, std::memory_order_release);
+        consecutive_rejects_.store(0, std::memory_order_relaxed);
+        std::remove("holo_halt.flag");
+        std::cerr << "[ExecutionEngine] circuit breaker manually reset — resuming signal processing.\n";
     }
 
     // Entry point called by your signal generator. Registers both legs in
@@ -225,7 +251,59 @@ public:
     // race-condition note (1) at the top of this file), fires both GTX
     // orders, then hands off monitoring to a detached coroutine so the
     // signal-processing loop is not blocked on the outcome of this pair.
+    //
+    // Two independent guards run here before a single order is sent:
+    //  - the circuit breaker (halted_) — tripped by a burst of rejects;
+    //  - max_open_orders_ — a hard ceiling on concurrently-live orders,
+    //    independent of *why* they're live. This is what actually stops
+    //    unbounded order-flood scenarios (e.g. UserDataFeed down so
+    //    nothing ever reaches a terminal state, or a signal generator
+    //    firing faster than legs resolve) rather than relying on the
+    //    exchange's rate limiter to push back for you with 429s.
     asio::awaitable<void> on_signal(ArbLeg leg1, ArbLeg leg2) {
+        if (halted_.load(std::memory_order_acquire)) {
+            throttled_log(last_halt_log_ns_, halt_drops_suppressed_,
+                          "circuit breaker is TRIPPED (call reset_halt() after investigating)");
+            co_return;
+        }
+        const std::size_t live = oms_.live_order_count();
+        if (live >= max_open_orders_) {
+            throttled_log(last_capacity_log_ns_, capacity_drops_suppressed_,
+                          std::to_string(live) + " live orders >= max_open_orders_ (" +
+                              std::to_string(max_open_orders_) +
+                              "). Feed may be stalled (orders never reaching a terminal state) "
+                              "or signal rate exceeds fill/cancel rate");
+            co_return;
+        }
+
+        // Root-cause guard for signal-flood exhaustion: the router can (and
+        // in practice does) re-select the *same* edge on back-to-back
+        // ticks faster than a previous pair for that same symbol
+        // combination has resolved. Without this check, a single
+        // persistent edge floods max_open_orders_ and/or the reject
+        // counter within milliseconds, well before monitor_pair() for the
+        // first instance even gets a chance to finish. One in-flight
+        // arb per symbol pair at a time; the next signal for that pair is
+        // simply skipped until the current one reaches a terminal state.
+        const std::string pair_key = leg1.symbol + "|" + leg2.symbol;
+        {
+            std::lock_guard lk(inflight_mtx_);
+            if (!inflight_pairs_.insert(pair_key).second) {
+                throttled_log(last_dup_log_ns_, dup_drops_suppressed_,
+                              "duplicate signal for " + pair_key +
+                                  " while a previous pair on it is still in flight");
+                co_return;
+            }
+        }
+        // Guarantees the pair_key entry is removed if anything between here
+        // and the co_spawn below throws (e.g. the gateway send failing) —
+        // without this, an exception would leave that symbol pair
+        // permanently stuck in inflight_pairs_, silently blocking it from
+        // ever trading again for the rest of the process's life. Disarmed
+        // right before co_spawn, at which point the spawned coroutine's
+        // completion handler takes over cleanup responsibility instead.
+        InflightGuard guard{*this, pair_key};
+
         const std::string id1 = next_client_id();
         const std::string id2 = next_client_id();
 
@@ -238,12 +316,44 @@ public:
         co_await gateway_.send_limit_post_only(id1, leg1.symbol, leg1.side, leg1.price, leg1.qty);
         co_await gateway_.send_limit_post_only(id2, leg2.symbol, leg2.side, leg2.price, leg2.qty);
 
+        guard.disarm();
         asio::co_spawn(exec_,
                         monitor_pair(id1, leg1, chan1, id2, leg2, chan2),
-                        [this](std::exception_ptr e) { log_exception("monitor_pair", e); });
+                        [this, pair_key](std::exception_ptr e) {
+                            log_exception("monitor_pair", e);
+                            clear_inflight(pair_key);
+                        });
+    }
+
+    // Lets the signal-generation loop skip printing/spawning altogether for
+    // signals it already knows on_signal() would drop — cuts log spam and
+    // wasted coroutine spawns at the source, rather than only suppressing
+    // the log line after the fact.
+    [[nodiscard]] bool is_at_capacity() const noexcept {
+        return oms_.live_order_count() >= max_open_orders_;
     }
 
     [[nodiscard]] PnlBook& pnl() noexcept { return pnl_; }
+
+    // "Уборщик" / stale-order sweeper: periodically cancels resting orders
+    // older than max_age that haven't reached a terminal state — the
+    // scenario monitor_pair() does NOT cover on its own, because its
+    // kLegTimeout logic only engages once one leg of a pair has already
+    // filled. A pair where *neither* leg ever fills (price ran away from
+    // both GTX prices) would otherwise rest forever, eventually exhausting
+    // max_open_orders_ and freezing margin against orders with no chance
+    // of filling at their original (now stale) price.
+    //
+    // Call this once after construction, e.g.:
+    //   exec.start_stale_order_sweeper();
+    // Safe to leave running for the process lifetime; cancels are cheap
+    // and idempotent (Binance just errors a second cancel on an
+    // already-terminal order, which we ignore).
+    void start_stale_order_sweeper(std::chrono::seconds sweep_interval = std::chrono::seconds(10),
+                                    std::chrono::nanoseconds max_age = std::chrono::seconds(10)) {
+        asio::co_spawn(exec_, sweeper_loop(sweep_interval, max_age),
+                        [this](std::exception_ptr e) { log_exception("sweeper_loop", e); });
+    }
 
 private:
     static constexpr auto kLegTimeout   = std::chrono::milliseconds(50);
@@ -294,10 +404,26 @@ private:
         }
 
         if (first_rec.status != OrderStatus::Filled) {
-            // First leg to settle was Canceled/Rejected, not Filled — no
-            // exposure was ever taken, nothing to hedge. Clean up both.
+            // First leg to settle was Canceled/Rejected — but that does
+            // NOT guarantee the partner leg has zero exposure: the
+            // partner could fill (or be filling) independently at the
+            // exact same moment, especially now that the stale-order
+            // sweeper (see start_stale_order_sweeper()) can cancel either
+            // leg of a pair on its own schedule. The pair no longer has a
+            // reason to exist either way, so cancel the partner and
+            // check its *authoritative* outcome before deciding whether
+            // there's anything to hedge — the same pattern used below for
+            // the leg-timeout path.
             release_terminal(filled_key);
+            co_await gateway_.cancel_order(resting_leg.symbol, resting_id);
+            const OrderRecord partner_final =
+                co_await await_authoritative_after_cancel(resting_chan, resting_key, resting_id);
             release_terminal(resting_key);
+
+            if (partner_final.filled_qty > 0.0) {
+                apply_fill_pnl(partner_final, resting_leg);
+                co_await hedge_remaining(resting_leg, partner_final.qty - partner_final.filled_qty);
+            }
             co_return;
         }
         apply_fill_pnl(first_rec, first.index() == 0 ? leg1 : leg2);
@@ -335,62 +461,113 @@ private:
         co_await gateway_.cancel_order(resting_leg.symbol, resting_id);
 
         // Race-condition note (4): don't trust a pre-cancel snapshot for
-        // hedge sizing. Re-await the channel for the authoritative
-        // terminal state the cancel (or a concurrent fill) produces,
-        // bounded by kCancelAckTimeout in case the cancel ack itself is
-        // lost/delayed.
-        asio::steady_timer ack_timer(exec_);
-        ack_timer.expires_after(kCancelAckTimeout);
-        auto post_cancel = co_await (wait_for_terminal_or_filled(resting_chan) ||
-                                      ack_timer.async_wait(asio::use_awaitable));
-
-        OrderRecord final_rec;
-        if (post_cancel.index() == 0) {
-            final_rec = std::get<0>(post_cancel);
-        } else {
-            // Cancel ack never arrived within kCancelAckTimeout — fall
-            // back to the last known OMS snapshot rather than hang
-            // forever. Flag loudly: this is an operational anomaly (lost
-            // WS message / venue latency spike) that deserves paging, not
-            // silent handling.
-            std::cerr << "[ExecutionEngine] WARNING: no cancel ack for " << resting_id
-                      << " within " << kCancelAckTimeout.count()
-                      << "ms; using last known OMS state for hedge sizing.\n";
-            auto snap = oms_.get(resting_key);
-            if (!snap) { release_terminal(resting_key); co_return; }
-            final_rec = *snap;
-        }
+        // hedge sizing — wait for the authoritative post-cancel outcome.
+        const OrderRecord final_rec =
+            co_await await_authoritative_after_cancel(resting_chan, resting_key, resting_id);
+        release_terminal(resting_key);
 
         if (final_rec.status == OrderStatus::Filled) {
             apply_fill_pnl(final_rec, resting_leg);
-            release_terminal(resting_key);
             co_return;  // filled before/during the cancel race — nothing to hedge
         }
         if (final_rec.filled_qty > 0.0) {
-            // Partial fill before it was actually canceled/rejected.
-            apply_fill_pnl(final_rec, resting_leg);
+            apply_fill_pnl(final_rec, resting_leg);  // partial fill before the cancel landed
         }
-        release_terminal(resting_key);
+        co_await hedge_remaining(resting_leg, final_rec.qty - final_rec.filled_qty);
+    }
 
-        const double remaining = final_rec.qty - final_rec.filled_qty;
-        if (remaining > 1e-12) {
-            const std::string hedge_id = next_client_id();
-            const Side hedge_side = resting_leg.side;  // hedge in the SAME direction
-                                                          // the resting leg would have
-                                                          // filled, to realize the exposure
-                                                          // the completed leg opened.
-            oms_.register_new_order(hedge_id, resting_leg.symbol, hedge_side, 0.0, remaining);
-            auto hedge_chan = get_or_create_waiter(fnv1a64(hedge_id));
-            co_await gateway_.send_market(hedge_id, resting_leg.symbol, hedge_side, remaining);
+    // Sends the cancel request already having been issued by the caller,
+    // waits up to kCancelAckTimeout for the *authoritative* terminal state
+    // it (or a racing fill) produces, and falls back to the last-known OMS
+    // snapshot — loudly — if the ack never arrives.
+    //
+    // BUG FIX (found via testing, pre-existing / independent of the
+    // in-flight-pair dedup guard above): when monitor_pair()'s initial
+    // race — `wait_for_terminal_or_filled(chan1) || wait_for_terminal_or_
+    // filled(chan2)` — has both legs settle to a terminal state at
+    // essentially the same instant (e.g. both GTX legs rejected together,
+    // or the stale-order sweeper canceling both legs of a pair on the
+    // same tick), the *losing* operand's already-buffered terminal
+    // message gets silently consumed and discarded as part of that race
+    // resolving, even though it never became this function's `first_rec`.
+    // The result: this function's own race against resting_chan finds the
+    // channel empty and unconditionally burns the full kCancelAckTimeout
+    // (750ms) before falling back — on every single dual-terminal event,
+    // not just rare ones. Since OMSCore::apply_update() always mutates its
+    // own authoritative record before firing the pub/sub callback that
+    // feeds the channel, checking it directly here is a correct and
+    // race-condition-proof short-circuit: it doesn't matter whether the
+    // channel ever delivered (or lost) the message, only whether the order
+    // has already reached a terminal state by the time we ask.
+    asio::awaitable<OrderRecord> await_authoritative_after_cancel(std::shared_ptr<Chan> chan,
+                                                                    uint64_t key,
+                                                                    const std::string& id_for_log) {
+        if (auto snap = oms_.get(key); snap && is_terminal(snap->status)) {
+            co_return *snap;
+        }
 
-            // Race-condition note (5): track the hedge order to
-            // completion too, so its fill feeds PnL and its OMS slot is
-            // released. Detached: on_signal()/monitor_pair() must not
-            // block on this, and there is nothing further to coordinate
-            // once the hedge is away.
-            asio::co_spawn(
-                exec_, watch_hedge(hedge_id, resting_leg.symbol, hedge_side, hedge_chan),
-                [this](std::exception_ptr e) { log_exception("watch_hedge", e); });
+        using namespace boost::asio::experimental::awaitable_operators;
+        asio::steady_timer ack_timer(exec_);
+        ack_timer.expires_after(kCancelAckTimeout);
+        auto outcome = co_await (wait_for_terminal_or_filled(chan) ||
+                                  ack_timer.async_wait(asio::use_awaitable));
+        if (outcome.index() == 0) co_return std::get<0>(outcome);
+
+        std::cerr << "[ExecutionEngine] WARNING: no cancel ack for " << id_for_log << " within "
+                  << kCancelAckTimeout.count()
+                  << "ms; using last known OMS state.\n";
+        auto snap = oms_.get(key);
+        co_return snap ? *snap : OrderRecord{};
+    }
+
+    // Registers, sends, and hands off tracking of a MARKET hedge order for
+    // `remaining` units of `leg.symbol`/`leg.side`. No-ops if there's
+    // nothing to hedge. See race-condition note (5) for why the hedge
+    // must be tracked to completion rather than fire-and-forgotten.
+    asio::awaitable<void> hedge_remaining(const ArbLeg& leg, double remaining) {
+        if (remaining <= 1e-12) co_return;
+        const std::string hedge_id = next_client_id();
+        const Side hedge_side = leg.side;  // hedge in the SAME direction the resting leg
+                                            // would have filled, to realize the exposure
+                                            // the completed/canceled counterpart opened.
+        oms_.register_new_order(hedge_id, leg.symbol, hedge_side, 0.0, remaining);
+        auto hedge_chan = get_or_create_waiter(fnv1a64(hedge_id));
+        co_await gateway_.send_market(hedge_id, leg.symbol, hedge_side, remaining);
+
+        asio::co_spawn(exec_, watch_hedge(hedge_id, leg.symbol, hedge_side, hedge_chan),
+                        [this](std::exception_ptr e) { log_exception("watch_hedge", e); });
+    }
+
+    asio::awaitable<void> sweeper_loop(std::chrono::seconds interval, std::chrono::nanoseconds max_age) {
+        asio::steady_timer timer(exec_);
+        std::vector<OrderRecord> stale;  // reused across ticks — no per-tick allocation
+                                          // once it grows to its high-water mark
+        for (;;) {
+            timer.expires_after(interval);
+            co_await timer.async_wait(asio::use_awaitable);
+
+            oms_.get_stale_orders(max_age.count(), stale);
+            if (stale.empty()) continue;
+
+            std::cerr << "[ExecutionEngine] sweeper: " << stale.size()
+                      << " order(s) stale beyond "
+                      << std::chrono::duration_cast<std::chrono::seconds>(max_age).count()
+                      << "s — canceling.\n";
+
+            // Best-effort, sequential: just get the cancel requests out.
+            // The authoritative outcome of each (Canceled, or a
+            // last-instant Filled racing the cancel) arrives via
+            // UserDataFeed -> dispatch_update() as normal. If a swept
+            // order is one leg of a pair whose monitor_pair() is still
+            // running, monitor_pair()'s own "first leg settled without
+            // filling" branch (which re-checks the partner's
+            // authoritative state before deciding whether to hedge) is
+            // what actually handles the fallout — the sweeper's only job
+            // is to stop paying rent on stale resting orders, not to
+            // duplicate risk decisions monitor_pair already owns.
+            for (const auto& rec : stale) {
+                co_await gateway_.cancel_order(view(rec.symbol), view(rec.client_order_id));
+            }
         }
     }
 
@@ -437,6 +614,11 @@ private:
             pnl_.apply_fill(leg.symbol, leg.side, delta, rec.avg_fill_price);
         }
         prev = rec.filled_qty;
+
+        double& prev_comm = last_commission_[rec.exchange_order_id];
+        const double comm_delta = rec.cumulative_commission - prev_comm;
+        if (comm_delta > 1e-12) pnl_.apply_commission(leg.symbol, comm_delta);
+        prev_comm = rec.cumulative_commission;
     }
 
     void release_terminal(uint64_t key) {
@@ -461,6 +643,22 @@ private:
     }
 
     void dispatch_update(const OrderRecord& rec) {
+        // Circuit breaker bookkeeping — independent of whether a monitor
+        // is actively waiting on this specific order (waiters_ lookup
+        // below): a stuck condition (bad margin, bad precision, exchange
+        // rate limit) rejects *every* order it touches, monitored or not.
+        if (rec.status == OrderStatus::Rejected) {
+            const auto n = consecutive_rejects_.fetch_add(1, std::memory_order_acq_rel) + 1;
+            if (n >= kMaxConsecutiveRejects && !halted_.exchange(true, std::memory_order_acq_rel)) {
+                std::cerr << "[ExecutionEngine] CIRCUIT BREAKER TRIPPED: " << n
+                          << " consecutive order rejects. Halting new signal processing. "
+                             "Check margin/precision/rate-limit state, then call reset_halt().\n";
+                write_halt_flag(std::to_string(n) + " consecutive order rejects");
+            }
+        } else if (rec.status == OrderStatus::Open || rec.status == OrderStatus::Filled) {
+            consecutive_rejects_.store(0, std::memory_order_release);
+        }
+
         const uint64_t key = fnv1a64(view(rec.client_order_id));
         std::shared_ptr<Chan> chan;
         {
@@ -477,6 +675,48 @@ private:
                       << view(rec.client_order_id) << " (status="
                       << static_cast<int>(rec.status)
                       << ") — channel buffer full. Increase kChanBuffer.\n";
+        }
+    }
+
+    // Collapses a message that would otherwise repeat on every single
+    // dropped signal (which, at a 2ms polling interval with a persistent
+    // condition, means thousands of identical lines per second) down to
+    // one line per kLogThrottleNs, with a count of how many were
+    // suppressed in between. This is what actually made the circuit
+    // breaker / capacity logs legible instead of drowning the terminal.
+    static constexpr int64_t kLogThrottleNs = 2'000'000'000;  // 2s
+
+    void throttled_log(std::atomic<int64_t>& last_ns, std::atomic<uint64_t>& suppressed,
+                        const std::string& msg) {
+        const int64_t t = now_ns();
+        int64_t prev = last_ns.load(std::memory_order_relaxed);
+        if (t - prev < kLogThrottleNs) {
+            suppressed.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        if (!last_ns.compare_exchange_strong(prev, t, std::memory_order_relaxed)) return;
+        const uint64_t n = suppressed.exchange(0, std::memory_order_relaxed);
+        std::cerr << "[ExecutionEngine] signal dropped — " << msg;
+        if (n > 0) std::cerr << " (+" << n << " more suppressed in the last "
+                              << kLogThrottleNs / 1'000'000'000 << "s)";
+        std::cerr << "\n";
+    }
+
+    void clear_inflight(const std::string& pair_key) {
+        std::lock_guard lk(inflight_mtx_);
+        inflight_pairs_.erase(pair_key);
+    }
+
+    // Best-effort: lets an external monitor/supervisor (cron, systemd
+    // watchdog, a dashboard tailing the working directory) notice a trip
+    // even if it isn't tailing stdout at the moment it happens — the
+    // stderr line alone is easy to miss on an unattended box. Failure to
+    // write this file is intentionally non-fatal.
+    void write_halt_flag(const std::string& reason) {
+        try {
+            std::ofstream f("holo_halt.flag", std::ios::trunc);
+            f << "HALTED at " << now_ns() << "ns — " << reason << "\n";
+        } catch (...) {
         }
     }
 
@@ -499,11 +739,50 @@ private:
     PnlBook pnl_;
     std::atomic<uint64_t> seq_{0};
 
+    static constexpr int kMaxConsecutiveRejects = 5;
+    std::size_t max_open_orders_;
+    std::atomic<bool> halted_{false};
+    std::atomic<int> consecutive_rejects_{0};
+
+    // Throttled-log state — one pair of atomics per distinct drop reason so
+    // a burst of one kind (e.g. capacity) never eats the log budget meant
+    // for another (e.g. halted), and vice versa.
+    std::atomic<int64_t> last_halt_log_ns_{0};
+    std::atomic<uint64_t> halt_drops_suppressed_{0};
+    std::atomic<int64_t> last_capacity_log_ns_{0};
+    std::atomic<uint64_t> capacity_drops_suppressed_{0};
+    std::atomic<int64_t> last_dup_log_ns_{0};
+    std::atomic<uint64_t> dup_drops_suppressed_{0};
+
+    // Which symbol pairs currently have an unresolved arb in flight — see
+    // the dedup guard in on_signal().
+    std::mutex inflight_mtx_;
+    std::unordered_set<std::string> inflight_pairs_;
+
+    // RAII cleanup for an inflight_pairs_ entry — see on_signal() for why
+    // this exists (an exception between insert and co_spawn must not leave
+    // the pair permanently stuck). disarm() hands cleanup responsibility
+    // off to the spawned coroutine's completion handler once we know it's
+    // actually going to run.
+    struct InflightGuard {
+        ExecutionEngine& eng;
+        std::string key;
+        bool armed{true};
+        InflightGuard(ExecutionEngine& e, std::string k) : eng(e), key(std::move(k)) {}
+        InflightGuard(const InflightGuard&) = delete;
+        InflightGuard& operator=(const InflightGuard&) = delete;
+        void disarm() { armed = false; }
+        ~InflightGuard() {
+            if (armed) eng.clear_inflight(key);
+        }
+    };
+
     std::mutex waiters_mtx_;
     std::unordered_map<uint64_t, std::shared_ptr<Chan>> waiters_;
 
     std::mutex last_filled_mtx_;
-    std::unordered_map<int64_t, double> last_filled_;  // keyed by exchange_order_id
+    std::unordered_map<int64_t, double> last_filled_;      // keyed by exchange_order_id
+    std::unordered_map<int64_t, double> last_commission_;  // keyed by exchange_order_id
 };
 
 }  // namespace holo::net
