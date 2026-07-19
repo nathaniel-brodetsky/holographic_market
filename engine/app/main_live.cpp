@@ -5,324 +5,253 @@
 #include <math/cuda_utils.cuh>
 #include <net/binance_feed.hpp>
 #include <net/signal_router.hpp>
+#include <net/oms_core.hpp>
+#include <net/user_data_feed.hpp>
+#include <net/binance_gateway.hpp>
 #include <net/execution_engine.hpp>
 
-#include <array>
-#include <atomic>
-#include <cstddef>
-#include <cstdint>
-#include <cstdio>
-#include <cstring>
-#include <cmath>
-#include <limits>
 #include <thread>
+#include <iostream>
+#include <string>
+#include <vector>
+#include <chrono>
+#include <iomanip>
+#include <cstdlib>
 
-#if defined(__linux__)
-#include <sched.h>
-#include <pthread.h>
-#include <time.h>
-#endif
+#include <boost/asio.hpp>
+#include <boost/beast.hpp>
+#include <boost/beast/ssl.hpp>
+#include <boost/beast/http.hpp>
 
-namespace holo
-{
-    static constexpr std::size_t  k_n_instruments    = k_feed_n_instruments;
-    static constexpr std::size_t  k_depth_levels = 1U;
-    static constexpr std::size_t  k_ring_capacity    = 1U << 17U;
-    static constexpr std::size_t  k_arena_size_bytes = 256U * 1024U * 1024U;
-    static constexpr std::uint64_t k_pipeline_run_ns = 30'000'000'000ULL * 360;
+using namespace holo;
+using namespace holo::cuda;
+using namespace holo::net;
 
-    [[nodiscard]] static std::uint64_t now_ns() noexcept
-    {
-        struct timespec ts{};
-        clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
-        return static_cast<std::uint64_t>(ts.tv_sec) * 1'000'000'000ULL +
-               static_cast<std::uint64_t>(ts.tv_nsec);
+// Функция для получения ListenKey (нужен для User Data Stream)
+std::string fetch_listen_key(const std::string& api_key) {
+    namespace beast = boost::beast;
+    namespace http = beast::http;
+    namespace asio = boost::asio;
+    namespace ssl = asio::ssl;
+
+    asio::io_context ioc;
+    ssl::context ctx(ssl::context::tlsv12_client);
+    ctx.set_default_verify_paths();
+
+    asio::ip::tcp::resolver resolver(ioc);
+    beast::ssl_stream<beast::tcp_stream> stream(ioc, ctx);
+
+    auto const results = resolver.resolve("testnet.binancefuture.com", "443");
+    beast::get_lowest_layer(stream).connect(results);
+
+    if(!SSL_set_tlsext_host_name(stream.native_handle(), "testnet.binancefuture.com")) {
+        throw std::runtime_error("SNI Failed");
     }
 
-#if defined(__linux__)
-    static void pin_thread(std::thread& t, int core_id) noexcept
-    {
-        cpu_set_t cpuset;
-        CPU_ZERO(&cpuset);
-        CPU_SET(static_cast<std::size_t>(core_id), &cpuset);
-        pthread_setaffinity_np(t.native_handle(), sizeof(cpu_set_t), &cpuset);
+    stream.handshake(ssl::stream_base::client);
+
+    http::request<http::empty_body> req{http::verb::post, "/fapi/v1/listenKey", 11};
+    req.set(http::field::host, "testnet.binancefuture.com");
+    req.set("X-MBX-APIKEY", api_key);
+
+    http::write(stream, req);
+
+    beast::flat_buffer buffer;
+    http::response<http::string_body> res;
+    http::read(stream, buffer, res);
+
+    beast::error_code ec;
+    stream.shutdown(ec);
+
+    std::string body = res.body();
+    size_t pos = body.find(R"("listenKey":")");
+    if(pos != std::string::npos) {
+        pos += 13;
+        return body.substr(pos, body.find("\"", pos) - pos);
     }
-#else
-    static void pin_thread(std::thread&, int) noexcept {}
-#endif
+    throw std::runtime_error("Failed to get listenKey. Response: " + body);
+}
 
-    static void print_separator() noexcept
-    {
-        std::puts("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    }
-
-    static void print_section(const char* title) noexcept
-    {
-        print_separator();
-        std::printf("  %s\n", title);
-        print_separator();
-    }
-
-    static void drain_ring_to_lob(
-        DynamicSpscRingBuffer<LobUpdate>& ring,
-        LobSoA& lob) noexcept
-    {
-        LobUpdate u{};
-        while (ring.try_pop(u))
-            lob.apply(u);
-    }
-
-    static void print_phase4_status(
-        const cuda::SignalRecord& sig,
-        const FeedMetrics&        feed,
-        const RouterMetrics&      router,
-        double elapsed_s) noexcept
-    {
-        std::printf(
-            "\r  [%5.1fs] S_YM=%.4f β₁=%d curl_max=%.4f | "
-            "feed=%llu drop=%llu | routed=%llu suppress=%llu     ",
-            elapsed_s,
-            static_cast<double>(sig.yang_mills_action),
-            sig.n_harmonic_dims,
-            static_cast<double>(sig.max_curl),
-            static_cast<unsigned long long>(
-                feed.msgs_received.load(std::memory_order_relaxed)),
-            static_cast<unsigned long long>(
-                feed.msgs_dropped.load(std::memory_order_relaxed)),
-            static_cast<unsigned long long>(
-                router.edges_routed.load(std::memory_order_relaxed)),
-            static_cast<unsigned long long>(
-                router.signals_suppressed.load(std::memory_order_relaxed)));
-        std::fflush(stdout);
-    }
-
-    // Host-side curl flow extraction from CudaPipeline (shallow bridge).
-    // We read h_curl_out_ via the public accessor added to CudaPipeline.
-    // Phase IV adds a copy of the harmonic flow vector to host after each
-    // decomposition. The accessor is declared extern here; the pipeline
-    // must expose it or we provide a fallback synthetic signal for routing.
-
-
-
-    // Synthesize harmonic flows from last signal for routing when no
-    // direct GPU pointer is accessible from this translation unit.
-} // namespace holo
-
-int main()
-{
-    using namespace holo;
-    using namespace holo::cuda;
-
-    std::puts("\n");
-    print_separator();
-    std::puts("  HOLOGRAPHIC MARKET ARCHITECTURE  v0.4.0");
-    std::puts("  Phase IV: Multi-Asset Cross-Instrument Signal Engine");
-    std::puts("  Phase V:  Async Execution Gateway (Paper Trading)");
-    print_separator();
-    std::puts("");
-
-    MemoryArena arena{k_arena_size_bytes};
-
-    using RingT = DynamicSpscRingBuffer<LobUpdate>;
-
-    RingT* const ring_ptr = arena.emplace<RingT>(arena, k_ring_capacity);
-    if (!ring_ptr)
-    {
-        std::puts("FATAL: ring alloc failed");
+int main() {
+    // --- 1. CONFIGURATION ---
+    // Credentials must never live in source (they end up in git history and
+    // in every build artifact). Set these in the environment before
+    // starting the process, e.g.:
+    //   export HOLO_API_KEY=...
+    //   export HOLO_API_SECRET=...
+    const char* env_key = std::getenv("HOLO_API_KEY");
+    const char* env_secret = std::getenv("HOLO_API_SECRET");
+    if (!env_key || !env_secret) {
+        std::cerr << "[FATAL] HOLO_API_KEY and HOLO_API_SECRET environment variables must be "
+                     "set (do not hardcode credentials in source).\n";
         return 1;
     }
+    std::string api_key = env_key;
+    std::string api_secret = env_secret;
 
-    LobSoA* const lob_ptr = arena.emplace<LobSoA>(arena, k_n_instruments, k_depth_levels);
-    if (!lob_ptr)
-    {
-        std::puts("FATAL: lob alloc failed");
-        return 1;
-    }
+    const double order_size_usd = 100.0;
+    const double max_position_usd = 100'000.0;
 
-    std::printf("  Arena capacity : %.1f MB\n",
-        static_cast<double>(arena.capacity()) / 1e6);
-    std::printf("  Arena used     : %.3f MB\n\n",
-        static_cast<double>(arena.used()) / 1e6);
+    std::cout << "========================================================\n";
+    std::cout << "  HOLOGRAPHIC MARKET ARCHITECTURE  v2.0 (Maker OMS)\n";
+    std::cout << "========================================================\n";
 
-    // ── Phase IV: Live multi-instrument feed ─────────────────────────────
-    print_section("PHASE IV — BINANCE LIVE FEED (BTC/ETH/SOL/BNB)");
+    // --- 2. MEMORY & DATA STRUCTURES ---
+    MemoryArena arena{256U * 1024U * 1024U};
+    auto* ring_ptr = arena.emplace<DynamicSpscRingBuffer<holo::core::LobUpdate>>(arena, 1U << 17U);
+    auto* lob_ptr = arena.emplace<holo::core::LobSoA>(arena, k_feed_n_instruments, 1U);
 
+    // --- 3. BINANCE MARKET DATA FEED ---
     BinanceFeedHandler feed{*ring_ptr};
     feed.start();
+    std::cout << "[INFO] Market data feed started. Warming up (2s)...\n";
+    std::this_thread::sleep_for(std::chrono::seconds(2));
 
-    // Give feed 2 s to populate LOB with real data.
-    {
-        struct timespec req{2, 0};
-        nanosleep(&req, nullptr);
-        drain_ring_to_lob(*ring_ptr, *lob_ptr);
+    holo::core::LobUpdate u{};
+    while (ring_ptr->try_pop(u)) {
+        lob_ptr->apply(u);
     }
 
-    std::printf("  Feed started. Instruments:\n");
-    for (std::size_t i = 0U; i < k_n_instruments; ++i)
-    {
-        std::printf("    [%zu] %s  mid=%.2f  spread=%.4f\n",
-            i, k_symbols_upper[i].data(),
-            static_cast<double>(lob_ptr->mid_price(i)),
-            static_cast<double>(lob_ptr->spread(i)));
-    }
-    std::puts("");
-
-    // ── CUDA topological pipeline ────────────────────────────────────────
-    print_section("PHASE IV — CUDA CROSS-INSTRUMENT GRAPH LAPLACIAN");
-
+    // --- 4. CUDA PIPELINE & ROUTER ---
     CudaPipeline pipeline{*lob_ptr, arena, 0};
-    SignalRouter  router{k_n_instruments};
+    SignalRouter router{k_feed_n_instruments};
 
-    // ── Phase V: Execution engine (paper trading, testnet) ───────────────
-    // Use empty credentials for paper-only stub.
-    ExecutionEngine exec_engine{
-        "",           // api_key   (paper stub)
-        "",           // api_secret
-        10'000.0F,    // max_position_usd
-        100.0F        // order_size_usd
-    };
-    exec_engine.start();
+    // --- 5. ASIO & OMS INITIALIZATION ---
+    boost::asio::io_context ioc;
+    boost::asio::ssl::context ssl_ctx(boost::asio::ssl::context::tlsv12_client);
+
+    std::string listen_key;
+    try {
+        listen_key = fetch_listen_key(api_key);
+        std::cout << "[INFO] ListenKey acquired.\n";
+    } catch (const std::exception& e) {
+        std::cerr << "[ERROR] Could not fetch ListenKey: " << e.what() << "\n";
+        return 1;
+    }
+
+    OMSCore oms;
+
+    // UserDataFeed (Слушает исполнение ордеров по WebSocket)
+    UserDataFeed ud_feed(ioc.get_executor(), ssl_ctx, "testnet.binancefuture.com", listen_key, oms);
+    ud_feed.start();
+
+    // Шлюз отправки ордеров по WebSocket
+    BinanceGateway gateway(ioc.get_executor(), ssl_ctx, api_key, api_secret, oms);
+    gateway.start();
+
+    // Мозг: Execution Engine
+    ExecutionEngine exec(ioc.get_executor(), oms, gateway);
+    exec.start_stale_order_sweeper();
+
+    // --- 6. BACKGROUND THREADS ---
+    std::thread asio_thread([&ioc]() {
+        auto work_guard = boost::asio::make_work_guard(ioc);
+        ioc.run();
+    });
 
     std::atomic<bool> shutdown{false};
-
-    std::thread pipeline_thread{
-        [&pipeline, &shutdown]()
-        { pipeline.run_continuous(shutdown); }};
-    pin_thread(pipeline_thread, 2);
-
-    // LOB updater: drain ring → LOB continuously.
-    std::thread lob_drain_thread{
-        [&ring_ptr, &lob_ptr, &shutdown]()
-        {
-            while (!shutdown.load(std::memory_order_relaxed))
-            {
-                drain_ring_to_lob(*ring_ptr, *lob_ptr);
-                struct timespec req{0, 200'000};
-                nanosleep(&req, nullptr);
+    std::thread pipeline_thread{[&]() { pipeline.run_continuous(shutdown); }};
+    std::thread drain_thread{[&]() {
+        while(!shutdown.load(std::memory_order_relaxed)) {
+            while (ring_ptr->try_pop(u)) {
+                lob_ptr->apply(u);
             }
-        }};
-    pin_thread(lob_drain_thread, 4);
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
+        }
+    }};
 
-    print_section("PHASE IV+V — TOPOLOGICAL SIGNAL ROUTING & EXECUTION");
+    // Фоновый поток для логирования профита раз в 5 секунд
+    std::thread pnl_logger_thread{[&]() {
+        while(!shutdown.load(std::memory_order_relaxed)) {
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+            double total = exec.pnl().total_pnl([&](std::string_view sym) {
+                if (sym == "BTCUSDT") return lob_ptr->mid_price(0);
+                if (sym == "ETHUSDT") return lob_ptr->mid_price(1);
+                if (sym == "SOLUSDT") return lob_ptr->mid_price(2);
+                if (sym == "BNBUSDT") return lob_ptr->mid_price(3);
+                return 0.0f;
+            });
+            std::cout << "\n[PNL] Live MTM PnL (Realized + Unrealized): " << std::fixed << std::setprecision(4) << total << " USD | Live Orders in Book: " << oms.live_order_count() << "\n";
+        }
+    }};
 
-    const std::uint64_t t_start = now_ns();
-    std::uint64_t last_sig_gen  = 0U;
+    std::cout << "[INFO] HFT Maker Engine is LIVE and hunting for arbitrage...\n";
+    std::uint64_t last_sig_ts = 0;
 
-    while (now_ns() - t_start < k_pipeline_run_ns)
-    {
-        struct timespec req{0, 100'000'000};
-        nanosleep(&req, nullptr);
+    // --- 7. MAIN EVENT LOOP ---
+    while (true) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
 
-        const auto sig       = pipeline.last_signal();
-        const double elapsed = static_cast<double>(now_ns() - t_start) / 1.0e9;
+        auto sig = pipeline.last_signal();
+        if (sig.timestamp_ns != last_sig_ts && sig.timestamp_ns != 0) {
+            last_sig_ts = sig.timestamp_ns;
 
-        print_phase4_status(sig, feed.metrics(), router.metrics(), elapsed);
-
-        // Route only on new signal generation.
-        // Route only on new signal generation.
-        if (sig.timestamp_ns != last_sig_gen && sig.timestamp_ns != 0U)
-        {
-            last_sig_gen = sig.timestamp_ns;
-
-            const auto topo = pipeline.last_topology();
-
-            if (topo.n_edges > 0 && topo.harmonic_flow != nullptr)
-            {
-                SignalRouter::TopKBuffer top_edges{};
-                const std::size_t n_routed = router.route(
+            auto topo = pipeline.last_topology();
+            if (topo.n_edges > 0) {
+                SignalRouter::TopKBuffer edges{};
+                size_t n_routed = router.route(
                     sig,
-                    std::span<const float>{topo.harmonic_flow, static_cast<std::size_t>(topo.n_edges)},
-                    std::span<const int>{topo.edge_src,        static_cast<std::size_t>(topo.n_edges)},
-                    std::span<const int>{topo.edge_dst,        static_cast<std::size_t>(topo.n_edges)},
-                    top_edges);
+                    std::span<const float>{topo.harmonic_flow, (size_t)topo.n_edges},
+                    std::span<const int>{topo.edge_src, (size_t)topo.n_edges},
+                    std::span<const int>{topo.edge_dst, (size_t)topo.n_edges},
+                    edges
+                );
 
-                for (std::size_t k = 0U; k < n_routed; ++k)
-                {
-                    const auto& edge = top_edges[k];
-                    exec_engine.submit(
-                        edge,
-                        lob_ptr->mid_price(edge.src_instrument),
-                        lob_ptr->mid_price(edge.dst_instrument));
+                // If the engine is halted (circuit breaker) or already at
+                // its concurrent-order ceiling, on_signal() would drop
+                // every one of these anyway (and already logs a throttled
+                // reason for it). Skip the per-edge work, the mid-price
+                // lookups, and — most importantly — the "[SIGNAL] Placing
+                // Maker Limits" print entirely in that case: printing
+                // "Placing" for something that is guaranteed to be dropped
+                // is exactly what made the earlier logs look like orders
+                // were going out while the whole engine was blocked.
+                if (exec.is_halted() || exec.is_at_capacity()) {
+                    continue;
+                }
+
+                for (size_t i = 0; i < n_routed; ++i) {
+                    const auto& edge = edges[i];
+                    bool is_long = edge.harmonic_flow > 0.0f;
+
+                    std::string sym1 = std::string(k_symbols_upper[edge.src_instrument]);
+                    std::string sym2 = std::string(k_symbols_upper[edge.dst_instrument]);
+
+                    // Проверяем лимиты риска из PnlBook от Claude
+                    double cur_pos1_qty = std::abs(exec.pnl().snapshot(sym1).qty);
+                    if (cur_pos1_qty * lob_ptr->mid_price(edge.src_instrument) > max_position_usd) continue;
+
+                    // Нога 1 (Лимитка в спред)
+                    ExecutionEngine::ArbLeg leg1{
+                        sym1,
+                        is_long ? holo::net::Side::Buy : holo::net::Side::Sell,
+                        order_size_usd / lob_ptr->mid_price(edge.src_instrument),
+                        is_long ? lob_ptr->best_bid(edge.src_instrument) : lob_ptr->best_ask(edge.src_instrument)
+                    };
+
+                    // Нога 2 (Зеркальная лимитка)
+                    ExecutionEngine::ArbLeg leg2{
+                        sym2,
+                        is_long ? holo::net::Side::Sell : holo::net::Side::Buy,
+                        order_size_usd / lob_ptr->mid_price(edge.dst_instrument),
+                        is_long ? lob_ptr->best_ask(edge.dst_instrument) : lob_ptr->best_bid(edge.dst_instrument)
+                    };
+
+                    std::cout << "[SIGNAL] S_YM=" << sig.yang_mills_action << " | Placing Maker Limits for " << leg1.symbol << " & " << leg2.symbol << "\n";
+
+                    // Запускаем корутину
+                    boost::asio::co_spawn(ioc, exec.on_signal(leg1, leg2), boost::asio::detached);
                 }
             }
         }
-
     }
-    std::puts("\n");
-    shutdown.store(true, std::memory_order_release);
+
+    shutdown = true;
     pipeline_thread.join();
-    lob_drain_thread.join();
-    feed.stop();
-    exec_engine.stop();
-
-    // ── Final reports ─────────────────────────────────────────────────────
-    print_section("PHASE IV — CUDA PIPELINE METRICS");
-    const auto& pm = pipeline.metrics();
-    std::printf("  Transfers       : %llu\n",
-        static_cast<unsigned long long>(pm.n_transfers.load()));
-    std::printf("  Decompositions  : %llu\n",
-        static_cast<unsigned long long>(pm.n_decompositions.load()));
-    std::printf("  Arb signals     : %llu\n",
-        static_cast<unsigned long long>(pm.n_arbitrage_signals.load()));
-    if (pm.n_transfers.load() > 0U)
-        std::printf("  Mean xfr time   : %.3f ms\n",
-            static_cast<double>(pm.total_transfer_ns.load()) /
-            static_cast<double>(pm.n_transfers.load()) / 1e6);
-    if (pm.n_decompositions.load() > 0U)
-        std::printf("  Mean Hodge time : %.3f ms\n",
-            static_cast<double>(pm.total_decomp_ns.load()) /
-            static_cast<double>(pm.n_decompositions.load()) / 1e6);
-
-    const auto last_sig = pipeline.last_signal();
-    std::printf("  S_YM final      : %.6f\n",
-        static_cast<double>(last_sig.yang_mills_action));
-    std::printf("  β₁ final        : %d\n", last_sig.n_harmonic_dims);
-    std::printf("  Market eff.     : %s\n",
-        (last_sig.yang_mills_action < 0.01F)
-        ? "HIGH  (S_YM → 0)"
-        : "LOW   (S_YM >> 0, arb present)");
-    print_separator();
-
-    print_section("PHASE IV — FEED METRICS");
-    const auto& fm = feed.metrics();
-    std::printf("  Msgs received   : %llu\n",
-        static_cast<unsigned long long>(fm.msgs_received.load()));
-    std::printf("  Msgs dropped    : %llu\n",
-        static_cast<unsigned long long>(fm.msgs_dropped.load()));
-    std::printf("  Parse errors    : %llu\n",
-        static_cast<unsigned long long>(fm.parse_errors.load()));
-    std::printf("  Reconnects      : %llu\n",
-        static_cast<unsigned long long>(fm.reconnects.load()));
-    for (std::size_t i = 0U; i < k_n_instruments; ++i)
-        std::printf("  [%s] msgs=%llu\n",
-            k_symbols_upper[i].data(),
-            static_cast<unsigned long long>(
-                fm.per_instrument_msgs[i].load()));
-    print_separator();
-
-    print_section("PHASE V — EXECUTION ENGINE (PAPER)");
-    exec_engine.print_risk_summary();
-    std::printf("  Total PnL (realized) : %.4f USD\n",
-        static_cast<double>(
-            exec_engine.metrics().total_pnl.load(std::memory_order_relaxed)));
-    print_separator();
-
-    print_section("ROUTER METRICS");
-    std::printf("  Signals processed : %llu\n",
-        static_cast<unsigned long long>(
-            router.metrics().signals_processed.load()));
-    std::printf("  Edges routed      : %llu\n",
-        static_cast<unsigned long long>(
-            router.metrics().edges_routed.load()));
-    std::printf("  Signals suppressed: %llu\n",
-        static_cast<unsigned long long>(
-            router.metrics().signals_suppressed.load()));
-    print_separator();
-
-    std::printf("\n  Arena utilization : %.2f%%\n",
-        arena.utilization() * 100.0);
-    std::puts("  Zero heap allocs on hot path : CONFIRMED");
-    std::puts("  Phase IV+V terminated        : CLEAN\n");
+    drain_thread.join();
+    pnl_logger_thread.join();
+    ioc.stop();
+    asio_thread.join();
 
     return 0;
 }
