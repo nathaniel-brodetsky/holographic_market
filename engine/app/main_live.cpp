@@ -120,6 +120,20 @@ int main() {
     boost::asio::io_context ioc;
     boost::asio::ssl::context ssl_ctx(boost::asio::ssl::context::tlsv12_client);
 
+    // CRITICAL: type-erase the io_context's executor into any_io_executor
+    // exactly once, here, and reuse `ex` everywhere below — including the
+    // co_spawn() call further down. io_context::executor_type is NOT
+    // any_io_executor; without BOOST_ASIO_NO_TS_EXECUTORS defined it's the
+    // legacy TS-style boost::asio::executor. Passing `ioc` (or its raw
+    // executor_type) straight into co_spawn()/coroutines that are typed on
+    // any_io_executor (as every awaitable<T> in this codebase is, via its
+    // default template argument) mixes two different executor types across
+    // one coroutine's awaitable_operators::operator|| chain, which is what
+    // produced the wall of "declared void" / incomplete-type template
+    // errors. Constructing `ex` here converts once, at a single well-defined
+    // boundary, so every consumer below sees the same executor type.
+    boost::asio::any_io_executor ex(ioc.get_executor());
+
     std::string listen_key;
     try {
         listen_key = fetch_listen_key(api_key);
@@ -132,15 +146,15 @@ int main() {
     OMSCore oms;
 
     // UserDataFeed (Слушает исполнение ордеров по WebSocket)
-    UserDataFeed ud_feed(ioc.get_executor(), ssl_ctx, "testnet.binancefuture.com", listen_key, oms);
+    UserDataFeed ud_feed(ex, ssl_ctx, "testnet.binancefuture.com", listen_key, oms);
     ud_feed.start();
 
     // Шлюз отправки ордеров по WebSocket
-    BinanceGateway gateway(ioc.get_executor(), ssl_ctx, api_key, api_secret, oms);
+    BinanceGateway gateway(ex, ssl_ctx, api_key, api_secret, oms);
     gateway.start();
 
     // Мозг: Execution Engine
-    ExecutionEngine exec(ioc.get_executor(), oms, gateway);
+    ExecutionEngine exec(ex, oms, gateway);
     exec.start_stale_order_sweeper();
 
     // --- 6. BACKGROUND THREADS ---
@@ -240,7 +254,13 @@ int main() {
                     std::cout << "[SIGNAL] S_YM=" << sig.yang_mills_action << " | Placing Maker Limits for " << leg1.symbol << " & " << leg2.symbol << "\n";
 
                     // Запускаем корутину
-                    boost::asio::co_spawn(ioc, exec.on_signal(leg1, leg2), boost::asio::detached);
+                    // FIX: spawn on `ex` (any_io_executor), not raw `ioc`.
+                    // Passing `ioc` here deduced the legacy TS-style
+                    // boost::asio::executor as this awaitable's executor
+                    // type, mismatching on_signal()'s declared
+                    // awaitable<void, any_io_executor> and blowing up deep
+                    // inside awaitable_operators::operator|| in monitor_pair().
+                    boost::asio::co_spawn(ex, exec.on_signal(leg1, leg2), boost::asio::detached);
                 }
             }
         }

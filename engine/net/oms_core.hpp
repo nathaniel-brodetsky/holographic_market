@@ -14,6 +14,7 @@
 // lock *before* invoking the update callback, so a slow subscriber can
 // never block a writer (the UserDataFeed's read loop) or another reader.
 //
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -24,6 +25,7 @@
 #include <optional>
 #include <shared_mutex>
 #include <string_view>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -106,6 +108,7 @@ struct OrderRecord {
     double      qty{0.0};
     double      filled_qty{0.0};
     double      avg_fill_price{0.0};
+    double      cumulative_commission{0.0};
     int64_t     exchange_order_id{0};
     int64_t     created_ns{0};
     int64_t     updated_ns{0};
@@ -182,7 +185,8 @@ public:
                        double cumulative_filled_qty,
                        double last_fill_price,
                        int64_t exchange_order_id,
-                       int64_t event_ns) {
+                       int64_t event_ns,
+                       double commission_delta = 0.0) {
         std::unique_lock lk(mtx_);
         auto it = index_.find(key);
         if (it == index_.end()) return false;
@@ -198,6 +202,12 @@ public:
             // fill price on this particular event) — still advance qty.
             rec.filled_qty = cumulative_filled_qty;
         }
+        // commission_delta is the per-event commission charged by the
+        // venue (Binance ORDER_TRADE_UPDATE field "n"), already a delta,
+        // not a running total — callers that don't pass one (e.g.
+        // BinanceGateway's own Rejected-only calls) get 0.0 and this is a
+        // no-op.
+        rec.cumulative_commission += commission_delta;
         rec.status            = new_status;
         rec.exchange_order_id = exchange_order_id;
         rec.updated_ns         = event_ns;
