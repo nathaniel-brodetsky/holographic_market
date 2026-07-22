@@ -142,8 +142,7 @@ holo_target_includes(holographic_live PRIVATE)
 target_link_libraries(holographic_live PRIVATE
     holo_compile_options holo_math holo_ai ${HOLO_NET_LINK_LIBS})
 target_compile_definitions(holographic_live PRIVATE
-    BOOST_ASIO_HAS_CO_AWAIT=1
-    BOOST_ASIO_USE_TS_EXECUTOR_AS_DEFAULT=0)
+    BOOST_ASIO_HAS_CO_AWAIT=1)
 set_target_properties(holographic_live PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
@@ -155,8 +154,7 @@ holo_target_includes(holographic_backtest PRIVATE)
 target_link_libraries(holographic_backtest PRIVATE
     holo_compile_options holo_math holo_ai ${HOLO_NET_LINK_LIBS})
 target_compile_definitions(holographic_backtest PRIVATE
-    BOOST_ASIO_HAS_CO_AWAIT=1
-    BOOST_ASIO_USE_TS_EXECUTOR_AS_DEFAULT=0)
+    BOOST_ASIO_HAS_CO_AWAIT=1)
 set_target_properties(holographic_backtest PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
