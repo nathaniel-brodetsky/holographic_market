@@ -621,23 +621,7 @@ private:
         prev_comm = rec.cumulative_commission;
     }
 
-    // BUG FIX: last_filled_/last_commission_ are keyed by exchange_order_id
-    // (see apply_fill_pnl above), not by the client-id key this function
-    // receives — and nothing was ever erasing them. On a long-running live
-    // engine that's an unbounded leak: one permanent entry in each map per
-    // order ever executed, for the lifetime of the process. Fetch the
-    // OMS snapshot *before* releasing the slot (release() erases the
-    // index_ entry get() depends on) so we have the exchange_order_id to
-    // erase by. exchange_order_id == 0 (orders rejected before the venue
-    // ever assigned a real id) is harmless to erase-if-present: those
-    // orders never reach apply_fill_pnl (no fill => no map entry created)
-    // since a WS-API-level reject carries filled_qty == 0.
     void release_terminal(uint64_t key) {
-        if (auto snap = oms_.get(key)) {
-            std::lock_guard lk(last_filled_mtx_);
-            last_filled_.erase(snap->exchange_order_id);
-            last_commission_.erase(snap->exchange_order_id);
-        }
         oms_.release(key);
         std::lock_guard lk(waiters_mtx_);
         waiters_.erase(key);
