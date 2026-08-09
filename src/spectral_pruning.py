@@ -51,14 +51,37 @@ def _compute_fiedler_arpack(
         laplacian: LaplacianMatrix,
         config: SpectralConfig,
 ) -> tuple[float, NDArray[np.float64]]:
-    eigenvalues, eigenvectors = spla.eigsh(
-        laplacian,
-        k=2,
-        which="SM",
-        tol=_PRUNING_TOLERANCE,
-        maxiter=config.max_eigen_iter,
-        return_eigenvectors=True,
-    )
+    # which="SM" (smallest-magnitude, no shift-invert) is explicitly flagged
+    # by scipy's own docs as poorly-converging / slow for near-singular
+    # matrices — and a normalized graph Laplacian always has an eigenvalue
+    # at (or extremely near) 0 by construction, i.e. it IS near-singular.
+    # Shift-invert (sigma near 0, which="LM") is the documented fix.
+    # sigma is a small *negative* offset rather than exactly 0 because
+    # shift-invert factorizes (laplacian - sigma*I); at sigma=0 exactly that
+    # matrix is itself singular for a connected-component Laplacian.
+    try:
+        eigenvalues, eigenvectors = spla.eigsh(
+            laplacian,
+            k=2,
+            sigma=-1e-8,
+            which="LM",
+            tol=_PRUNING_TOLERANCE,
+            maxiter=config.max_eigen_iter,
+            return_eigenvectors=True,
+        )
+    except (RuntimeError, spla.ArpackError, ValueError):
+        # Shift-invert factorization can fail on a disconnected/degenerate
+        # graph (singular or ill-conditioned (laplacian - sigma*I)). Fall
+        # back to the original, slower-but-more-robust mode rather than
+        # propagating a hard failure out of a pruning utility.
+        eigenvalues, eigenvectors = spla.eigsh(
+            laplacian,
+            k=2,
+            which="SM",
+            tol=_PRUNING_TOLERANCE,
+            maxiter=config.max_eigen_iter,
+            return_eigenvectors=True,
+        )
     return float(eigenvalues[1]), eigenvectors[:, 1]
 
 

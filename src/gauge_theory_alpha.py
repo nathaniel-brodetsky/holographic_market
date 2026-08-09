@@ -21,7 +21,15 @@ _ALPHA_LEARNING_RATE: Final[float] = 1e-3
 
 @dataclass(frozen=True, slots=True)
 class HodgeConfig:
-    use_bfloat16_topology: bool = True
+    # NOTE: harmonic_flow = flow - gradient_flow - curl_flow is a *residual*
+    # of nearly-equal terms by construction (it's the near-kernel component
+    # of Delta_1) — this is exactly the computation bfloat16's ~3 significant
+    # decimal digits are worst at. Casting up to float64 *after* computing in
+    # bf16 (see self._dtype_exec below) does not recover precision already
+    # lost during the subtraction itself. Default is float32 for the
+    # decomposition; opt into bf16 explicitly only if you've verified the
+    # resulting harmonic_flow signal-to-noise for your graph size/scale.
+    use_bfloat16_topology: bool = False
     ricci_flow_steps: int = 100
     ricci_dt: float = 0.01
 
@@ -57,10 +65,24 @@ def _build_incidence_matrices(
         edge_map[(u, v)] = i
         edge_map[(v, u)] = -i - 1
 
+    def _edge_lookup(a: int, b: int) -> int:
+        """Both orientations of every real edge are already keys in edge_map
+        (see loop above), so a single lookup on (a, b) suffices. If it's
+        missing, the face references an edge that doesn't exist in `edges`
+        at all — that's inconsistent input topology, not something to paper
+        over with a silent default (a silent default here would corrupt B2,
+        and therefore every downstream Hodge quantity, without any signal)."""
+        if (a, b) not in edge_map:
+            raise ValueError(
+                f"face references edge ({a}, {b}) that is not present in "
+                f"`edges` (in either orientation) — inconsistent topology input"
+            )
+        return edge_map[(a, b)]
+
     for f_idx, (u, v, w) in enumerate(faces):
-        e1: int = edge_map.get((u, v), edge_map.get((v, u), 0))
-        e2: int = edge_map.get((v, w), edge_map.get((w, v), 0))
-        e3: int = edge_map.get((w, u), edge_map.get((u, w), 0))
+        e1: int = _edge_lookup(u, v)
+        e2: int = _edge_lookup(v, w)
+        e3: int = _edge_lookup(w, u)
 
         s1: float = 1.0 if e1 >= 0 else -1.0
         s2: float = 1.0 if e2 >= 0 else -1.0

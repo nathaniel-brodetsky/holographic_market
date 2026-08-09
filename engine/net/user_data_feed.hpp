@@ -221,12 +221,18 @@ private:
         return v;
     }
 
-    static OrderStatus map_status(std::string_view s) noexcept {
+    static OrderStatus map_status(std::string_view s) {
         if (s == "NEW") return OrderStatus::Open;
         if (s == "PARTIALLY_FILLED") return OrderStatus::Partial;
         if (s == "FILLED") return OrderStatus::Filled;
         if (s == "CANCELED" || s == "EXPIRED") return OrderStatus::Canceled;
         if (s == "REJECTED") return OrderStatus::Rejected;
+        // Binance introducing a status we don't recognize should be loud,
+        // not a silent "treat it as still-open forever". Defaulting to Open
+        // is still the safest *behavior* (we don't want to prematurely mark
+        // a genuinely-live order as terminal), but it must not be silent.
+        std::cerr << "[UserDataFeed] unknown order status \"" << s
+                  << "\" — defaulting to Open; Binance API may have changed.\n";
         return OrderStatus::Open;
     }
 

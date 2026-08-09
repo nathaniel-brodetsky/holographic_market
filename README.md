@@ -10,7 +10,7 @@ A bare-metal GPU execution engine for **topological arbitrage detection** in liv
 
 **Phase I** — zero-allocation C++20 execution kernel, 64-byte aligned SPSC ring buffer.  
 **Phase II** — CUDA topological pipeline: normalized Laplacian → LOBPCG Fiedler vector → Hodge-De Rham decomposition → Yang-Mills curvature extraction.  
-**Phase III** *(current)* — live Binance L2 WebSocket feed handler + cuML DBSCAN on-device regime clustering.
+**Phase III** *(current)* — live Binance L2 WebSocket feed handler (implemented, wired in). cuML DBSCAN on-device regime clustering is scaffolded (`engine/ai/cuml_clustering.{cu,cuh}`, `TopologyClusterer`) but **not yet implemented** — every method is currently an empty stub, and the class is not instantiated anywhere in `main_live.cpp`/`main_backtest.cpp`/`cuda_pipeline.cu`. The live pipeline currently runs stages ①–⑤ only (Laplacian → LOBPCG → Hodge decomposition → signal extraction); stage ⑥ below is a design target, not a running component.
 
 ---
 
@@ -97,7 +97,9 @@ $$S_{YM}[A] = \frac{1}{4g^2} \sum_e F_e^2, \qquad F_e = (\gamma_e - \delta_e) + 
 $S_{YM} \to 0$: market approaches flat connection (zero arbitrage).  
 $S_{YM} \gg 0$: structural curvature present.
 
-### III.5 cuML DBSCAN Regime Clustering
+### III.5 cuML DBSCAN Regime Clustering — *design spec, not yet implemented*
+
+> **Status: not implemented.** `engine/ai/cuml_clustering.cu` currently contains only empty method bodies, and `TopologyClusterer` is not instantiated anywhere in the live or backtest binaries. The description below is the intended design, kept here as a spec for the eventual implementation — treat any numbers in III.6 for this stage as a target, not a measurement.
 
 On-device DBSCAN over a rolling window of $(S_{YM}, \max|\gamma|, \bar{|\gamma|}, \beta_1)$ feature vectors. Identifies macro-regimes of structural arbitrage without D→H copies on the signal path.
 
@@ -113,7 +115,7 @@ $$\text{DBSCAN}(\varepsilon, m_{\min}): \mathbb{R}^{|W| \times 4} \to \{-1, 0, 1
 | Hodge decomp (cuSOLVER Ssyevd) | ~500 μs |
 | Signal extraction | ~10 μs |
 | **Total pipeline** | **< 1 ms** |
-| DBSCAN (async, every 10 cycles) | ~5–20 ms |
+| DBSCAN (async, every 10 cycles) | ~5–20 ms *(target — stage not implemented, see III.5)* |
 
 ---
 
@@ -221,7 +223,7 @@ See [`DEPENDENCIES.md`](DEPENDENCIES.md) for the full manifest.
 
 **Remaining requirements for submission:**
 
-1. Real market data validation (Binance WebSocket, $N \geq 100$ instruments) ← **Phase III complete**
+1. Real market data validation (Binance WebSocket) ← **WS feed handler implemented and wired in; currently configured for N = 4 instruments (`k_feed_n_instruments` in `binance_feed.hpp`), not the N ≥ 100 target — and this item does not include the DBSCAN regime-clustering stage, which is unimplemented (see III.5)**
 2. Statistical backtest: Sharpe ratio of harmonic-flow-ranked portfolios vs. benchmark
 3. Comparison with PCA-based cross-impact models
 4. Formal discrete proof of Arbitrage-Curvature Correspondence

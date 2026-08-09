@@ -125,7 +125,11 @@ public:
     [[nodiscard]] const FeedMetrics& metrics() const noexcept { return metrics_; }
 
 private:
-    // FIX: use spot stream (stream.binance.com:9443) — correct for depth data
+    // fstream.binance.com is the USDT-M Futures market-data WS host — this is
+    // correct for this system. Everything downstream (OMS, binance_gateway,
+    // user_data_feed) is built against the Futures API (fapi/*), so do NOT
+    // change this to the spot host (stream.binance.com) — that would break
+    // symbol/precision handling and the OMS's assumptions throughout.
     static constexpr std::string_view k_ws_host = "fstream.binance.com";
     static constexpr std::string_view k_ws_port = "443";
     static constexpr std::size_t k_max_frame_bytes = 65536U;
