@@ -17,7 +17,17 @@ namespace holo::core
     static constexpr std::uint32_t k_invalid_seq   =
         std::numeric_limits<std::uint32_t>::max();
 
-    enum class Side : std::uint8_t
+    // Named BookSide (not Side) deliberately: holo::net has its own
+    // Side{Buy,Sell} enum (order-direction, in oms_core.hpp). Both used to
+    // be pulled into the shared `holo::` namespace via `using namespace`
+    // directives in several headers, colliding under the same short name
+    // "Side" — that only compiled because of a fragile #include-order
+    // dependency (whichever of core::Side / net::Side got declared first
+    // in a given translation unit "won" unqualified lookup). Reordering
+    // includes, or adding a `using namespace holo::net;` to a header that
+    // didn't have one, could silently break unqualified `Side::Bid` /
+    // `Side::Ask` references elsewhere. See holographic_market_AUDIT.md §4.
+    enum class BookSide : std::uint8_t
     {
         Bid = 0U,
         Ask = 1U
@@ -30,7 +40,7 @@ namespace holo::core
         float          quantity;
         std::uint32_t  instrument_id;
         std::uint8_t   depth_level;
-        Side           side;
+        BookSide       side;
         std::uint8_t   _pad[2];
     };
 
@@ -118,7 +128,7 @@ namespace holo::core
             seq_->value.fetch_add(1U, std::memory_order_relaxed);
             std::atomic_thread_fence(std::memory_order_release);
 
-            if (u.side == Side::Bid)
+            if (u.side == BookSide::Bid)
             {
                 bid_prices_[base] = u.price;
                 bid_qtys_[base]   = u.quantity;

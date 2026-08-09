@@ -17,8 +17,10 @@
 #include <chrono>
 #include <iomanip>
 #include <cstdlib>
+#include <csignal>
 
 #include <boost/asio.hpp>
+#include <boost/asio/signal_set.hpp>
 #include <boost/beast.hpp>
 #include <boost/beast/ssl.hpp>
 #include <boost/beast/http.hpp>
@@ -89,8 +91,23 @@ int main() {
     std::string api_key = env_key;
     std::string api_secret = env_secret;
 
-    const double order_size_usd = 100.0;
-    const double max_position_usd = 100'000.0;
+    // Risk parameters — overridable via ENV so changing a limit doesn't
+    // require a rebuild. Defaults match the previous hardcoded values.
+    const double order_size_usd = []() {
+        if (const char* v = std::getenv("HOLO_ORDER_SIZE_USD")) return std::strtod(v, nullptr);
+        return 100.0;
+    }();
+    const double max_position_usd = []() {
+        if (const char* v = std::getenv("HOLO_MAX_POSITION_USD")) return std::strtod(v, nullptr);
+        return 100'000.0;
+    }();
+    // PnL drawdown kill-switch threshold (see ExecutionEngine::check_drawdown).
+    // Default is deliberately conservative relative to max_position_usd;
+    // tune based on your own realized PnL history before relying on it.
+    const double max_drawdown_usd = []() {
+        if (const char* v = std::getenv("HOLO_MAX_DRAWDOWN_USD")) return std::strtod(v, nullptr);
+        return 2'000.0;
+    }();
 
     std::cout << "========================================================\n";
     std::cout << "  HOLOGRAPHIC MARKET ARCHITECTURE  v2.0 (Maker OMS)\n";
@@ -143,13 +160,32 @@ int main() {
     ExecutionEngine exec(ioc.get_executor(), oms, gateway);
     exec.start_stale_order_sweeper();
 
+    // Wire MARGIN_CALL (account-stream) events straight into the execution
+    // engine's halt — a margin call means a position is at liquidation
+    // risk, not something to merely log and hope someone is watching.
+    // Safe to set here even though ud_feed.start() was already called
+    // above: no user-data events are actually processed until asio_thread
+    // below starts running ioc.run().
+    ud_feed.set_margin_call_callback([&exec](std::string_view /*raw_event*/) {
+        exec.force_halt("MARGIN_CALL from Binance user-data stream");
+    });
+
     // --- 6. BACKGROUND THREADS ---
+    // `shutdown` and the signal handler are set up before asio_thread
+    // starts running ioc.run(), so there is no window where SIGINT/SIGTERM
+    // could arrive before we're ready to act on it.
+    std::atomic<bool> shutdown{false};
+    boost::asio::signal_set signals(ioc, SIGINT, SIGTERM);
+    signals.async_wait([&](const boost::system::error_code& ec, int sig) {
+        if (ec) return;  // cancelled (e.g. during normal shutdown teardown)
+        std::cout << "\n[INFO] Received signal " << sig << " — shutting down gracefully...\n";
+        shutdown.store(true, std::memory_order_relaxed);
+    });
+
     std::thread asio_thread([&ioc]() {
         auto work_guard = boost::asio::make_work_guard(ioc);
         ioc.run();
     });
-
-    std::atomic<bool> shutdown{false};
     std::thread pipeline_thread{[&]() { pipeline.run_continuous(shutdown); }};
     std::thread drain_thread{[&]() {
         while(!shutdown.load(std::memory_order_relaxed)) {
@@ -160,7 +196,11 @@ int main() {
         }
     }};
 
-    // Фоновый поток для логирования профита раз в 5 секунд
+    // Фоновый поток для логирования профита раз в 5 секунд —
+    // также прогоняет PnL drawdown kill-switch на каждом тике (см.
+    // ExecutionEngine::check_drawdown): reject-based circuit breaker выше
+    // не ловит случай, когда ордера успешно исполняются, но стратегия
+    // просто теряет деньги.
     std::thread pnl_logger_thread{[&]() {
         while(!shutdown.load(std::memory_order_relaxed)) {
             std::this_thread::sleep_for(std::chrono::seconds(5));
@@ -171,6 +211,7 @@ int main() {
                 if (sym == "BNBUSDT") return lob_ptr->mid_price(3);
                 return 0.0f;
             });
+            exec.check_drawdown(total, max_drawdown_usd);
             std::cout << "\n[PNL] Live MTM PnL (Realized + Unrealized): " << std::fixed << std::setprecision(4) << total << " USD | Live Orders in Book: " << oms.live_order_count() << "\n";
         }
     }};
@@ -179,7 +220,7 @@ int main() {
     std::uint64_t last_sig_ts = 0;
 
     // --- 7. MAIN EVENT LOOP ---
-    while (true) {
+    while (!shutdown.load(std::memory_order_relaxed)) {
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
 
         auto sig = pipeline.last_signal();
@@ -217,9 +258,13 @@ int main() {
                     std::string sym1 = std::string(k_symbols_upper[edge.src_instrument]);
                     std::string sym2 = std::string(k_symbols_upper[edge.dst_instrument]);
 
-                    // Проверяем лимиты риска из PnlBook от Claude
+                    // Проверяем лимиты риска из PnlBook — обе ноги
+                    // симметрично. Раньше проверялась только нога 1: вторая
+                    // могла свободно превышать max_position_usd.
                     double cur_pos1_qty = std::abs(exec.pnl().snapshot(sym1).qty);
+                    double cur_pos2_qty = std::abs(exec.pnl().snapshot(sym2).qty);
                     if (cur_pos1_qty * lob_ptr->mid_price(edge.src_instrument) > max_position_usd) continue;
+                    if (cur_pos2_qty * lob_ptr->mid_price(edge.dst_instrument) > max_position_usd) continue;
 
                     // Нога 1 (Лимитка в спред)
                     ExecutionEngine::ArbLeg leg1{
@@ -246,10 +291,27 @@ int main() {
         }
     }
 
-    shutdown = true;
+    std::cout << "[INFO] Shutdown signal handled, stopping background threads...\n";
+    shutdown.store(true, std::memory_order_relaxed);  // idempotent if a signal already set this
     pipeline_thread.join();
     drain_thread.join();
     pnl_logger_thread.join();
+
+    // NOTE: this does not cancel resting orders on the exchange — it only
+    // stops this process from placing new ones and joins local threads.
+    // Any orders still live in the OMS at this point remain resting on
+    // Binance; check testnet.binancefuture.com (or your account UI on
+    // mainnet) after a shutdown to confirm nothing unexpected is left
+    // open. Automatic cancel-on-shutdown is a reasonable next step but is
+    // deliberately not included here — it needs its own testing pass
+    // (cancel-all is itself an API call that can fail/partially succeed).
+    const std::size_t live_orders = oms.live_order_count();
+    if (live_orders > 0) {
+        std::cerr << "[WARN] Shutting down with " << live_orders
+                  << " order(s) still live in the OMS — they are NOT cancelled "
+                     "by this shutdown path. Verify manually.\n";
+    }
+
     ioc.stop();
     asio_thread.join();
 

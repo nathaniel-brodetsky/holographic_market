@@ -219,7 +219,7 @@ private:
             bid.timestamp_ns  = ts_ns;
             bid.instrument_id = instr_id;
             bid.depth_level   = 0U;
-            bid.side          = Side::Bid;
+            bid.side          = BookSide::Bid;
             bid.price         = bid_price;
             bid.quantity      = bid_qty;
 
@@ -227,7 +227,7 @@ private:
             ask.timestamp_ns  = ts_ns;
             ask.instrument_id = instr_id;
             ask.depth_level   = 0U;
-            ask.side          = Side::Ask;
+            ask.side          = BookSide::Ask;
             ask.price         = ask_price;
             ask.quantity      = ask_qty;
 

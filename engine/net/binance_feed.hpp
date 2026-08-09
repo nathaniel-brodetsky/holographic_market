@@ -3,285 +3,255 @@
 #include <core/lob_core.hpp>
 #include <core/lockfree_ring_buffer.hpp>
 
-#include <array>
 #include <atomic>
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
-#include <limits>
+#include <cstdio>
 #include <string>
-#include <string_view>
 #include <thread>
 
-#include <boost/asio/io_context.hpp>
-#include <boost/asio/ip/tcp.hpp>
-#include <boost/asio/ssl/context.hpp>
-#include <boost/asio/ssl/stream.hpp>
-#include <boost/beast/core.hpp>
-#include <boost/beast/core/tcp_stream.hpp>
-#include <boost/beast/ssl.hpp>
-#include <boost/beast/websocket.hpp>
-#include <boost/beast/websocket/ssl.hpp>
-#include <boost/beast/http/field.hpp>
-#include <boost/json.hpp>
-
-// FIX: SSL SNI requires openssl header
-#include <openssl/ssl.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 namespace holo::net
 {
 
-static constexpr std::size_t k_feed_n_instruments = 4U;
+enum class ReplayMode : std::uint8_t { Fastest, Realtime, Throttled };
 
-static constexpr std::array<std::string_view, k_feed_n_instruments> k_symbols = {
-    "btcusdt", "ethusdt", "solusdt", "bnbusdt"
+struct ReplayConfig
+{
+    ReplayMode    mode{ReplayMode::Fastest};
+    std::uint32_t msgs_per_sec{100'000U};
+    std::uint32_t max_gap_ms{500U};
 };
 
-static constexpr std::array<std::string_view, k_feed_n_instruments> k_symbols_upper = {
-    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"
+struct alignas(64) ReplayMetrics
+{
+    std::atomic<std::uint64_t> rows_read{0U};
+    std::atomic<std::uint64_t> updates_pushed{0U};
+    std::atomic<std::uint64_t> updates_dropped{0U};
+    std::atomic<std::uint64_t> parse_errors{0U};
+    std::atomic<bool>          finished{false};
 };
 
 namespace detail
 {
 
-// FIX: constexpr char-compare router (no hash collision risk, zero overhead)
-[[nodiscard]] constexpr std::uint32_t instrument_id_from_stream(std::string_view s) noexcept
+[[nodiscard]] inline const char* parse_u64(const char* p, const char* end,
+                                            std::uint64_t& out) noexcept
 {
-    if (s.size() >= 6)
-    {
-        if (s[0]=='b' && s[1]=='t' && s[2]=='c') return 0U;
-        if (s[0]=='e' && s[1]=='t' && s[2]=='h') return 1U;
-        if (s[0]=='s' && s[1]=='o' && s[2]=='l') return 2U;
-        if (s[0]=='b' && s[1]=='n' && s[2]=='b') return 3U;
-    }
-    return std::numeric_limits<std::uint32_t>::max();
+    out = 0U;
+    while (p < end && static_cast<unsigned>(*p - '0') < 10U)
+        out = out * 10ULL + static_cast<std::uint64_t>(*p++ - '0');
+    return p;
 }
 
-// FIX: locale-free fast float parser replacing std::stod
-// Uses boost::json's internal parser via number_cast — zero alloc.
-[[nodiscard]] inline float parse_price(std::string_view sv) noexcept
+[[nodiscard]] inline const char* parse_u32(const char* p, const char* end,
+                                            std::uint32_t& out) noexcept
 {
-    // boost::json::value from string_view without heap alloc via monotonic_resource
-    // For a string_view of a price like "65432.10", simple manual parse is fastest:
-    float result = 0.0F;
-    bool  dot    = false;
-    float frac   = 0.1F;
-    for (char c : sv)
-    {
-        if (c >= '0' && c <= '9')
-        {
-            if (!dot) result = result * 10.0F + static_cast<float>(c - '0');
-            else      { result += static_cast<float>(c - '0') * frac; frac *= 0.1F; }
-        }
-        else if (c == '.') dot = true;
-        else break;
-    }
-    return result;
+    out = 0U;
+    while (p < end && static_cast<unsigned>(*p - '0') < 10U)
+        out = out * 10U + static_cast<std::uint32_t>(*p++ - '0');
+    return p;
 }
 
-} // namespace holo::net::detail
-
-struct alignas(64) FeedMetrics
+[[nodiscard]] inline const char* parse_float(const char* p, const char* end,
+                                              float& out) noexcept
 {
-    std::atomic<std::uint64_t> msgs_received{0U};
-    std::atomic<std::uint64_t> msgs_dropped{0U};
-    std::atomic<std::uint64_t> parse_errors{0U};
-    std::atomic<std::uint64_t> reconnects{0U};
-    std::array<std::atomic<std::uint64_t>, k_feed_n_instruments> per_instrument_msgs{};
+    out = 0.0F;
+    while (p < end && static_cast<unsigned>(*p - '0') < 10U)
+        out = out * 10.0F + static_cast<float>(*p++ - '0');
+    if (p < end && *p == '.')
+    {
+        ++p;
+        float frac = 0.1F;
+        while (p < end && static_cast<unsigned>(*p - '0') < 10U)
+        { out += static_cast<float>(*p++ - '0') * frac; frac *= 0.1F; }
+    }
+    return p;
+}
 
-    FeedMetrics() noexcept
-    { for (auto& a : per_instrument_msgs) a.store(0U, std::memory_order_relaxed); }
-};
+[[nodiscard]] inline const char* skip_comma(const char* p, const char* end) noexcept
+{
+    while (p < end && *p != ',') ++p;
+    return (p < end) ? p + 1 : p;
+}
 
-class BinanceFeedHandler final
+[[nodiscard]] inline const char* skip_line(const char* p, const char* end) noexcept
+{
+    while (p < end && *p != '\n') ++p;
+    return (p < end) ? p + 1 : p;
+}
+
+[[nodiscard]] inline bool is_header(const char* p, const char* end) noexcept
+{
+    while (p < end && (*p == ' ' || *p == '\r')) ++p;
+    return p == end || *p == '\n' || (*p != '-' && (static_cast<unsigned>(*p - '0') >= 10U));
+}
+
+} // namespace detail
+
+class CsvReplayHandler final
 {
 public:
     using RingT = DynamicSpscRingBuffer<LobUpdate>;
 
-    explicit BinanceFeedHandler(RingT& ring) noexcept
-        : ring_{ring}, shutdown_{false} {}
+    explicit CsvReplayHandler(RingT& ring,
+                              std::string csv_path,
+                              ReplayConfig cfg = {}) noexcept
+        : ring_{ring}, path_{std::move(csv_path)}, cfg_{cfg}
+    {}
 
-    ~BinanceFeedHandler() noexcept { stop(); }
+    ~CsvReplayHandler() noexcept { stop(); }
 
-    BinanceFeedHandler(const BinanceFeedHandler&)            = delete;
-    BinanceFeedHandler& operator=(const BinanceFeedHandler&) = delete;
-    BinanceFeedHandler(BinanceFeedHandler&&)                 = delete;
-    BinanceFeedHandler& operator=(BinanceFeedHandler&&)      = delete;
+    CsvReplayHandler(const CsvReplayHandler&)            = delete;
+    CsvReplayHandler& operator=(const CsvReplayHandler&) = delete;
+    CsvReplayHandler(CsvReplayHandler&&)                 = delete;
+    CsvReplayHandler& operator=(CsvReplayHandler&&)      = delete;
 
     void start()
     {
         shutdown_.store(false, std::memory_order_release);
-        worker_ = std::thread([this]() { run_loop(); });
+        worker_ = std::thread([this]{ run(); });
     }
+
+    void join()  { if (worker_.joinable()) worker_.join(); }
 
     void stop() noexcept
     {
         shutdown_.store(true, std::memory_order_release);
-        try { ioc_.stop(); } catch (...) {}
         if (worker_.joinable()) worker_.join();
     }
 
-    [[nodiscard]] const FeedMetrics& metrics() const noexcept { return metrics_; }
+    [[nodiscard]] bool finished() const noexcept
+    { return metrics_.finished.load(std::memory_order_acquire); }
+
+    [[nodiscard]] const ReplayMetrics& metrics() const noexcept { return metrics_; }
 
 private:
-    // fstream.binance.com is the USDT-M Futures market-data WS host — this is
-    // correct for this system. Everything downstream (OMS, binance_gateway,
-    // user_data_feed) is built against the Futures API (fapi/*), so do NOT
-    // change this to the spot host (stream.binance.com) — that would break
-    // symbol/precision handling and the OMS's assumptions throughout.
-    static constexpr std::string_view k_ws_host = "fstream.binance.com";
-    static constexpr std::string_view k_ws_port = "443";
-    static constexpr std::size_t k_max_frame_bytes = 65536U;
-
-    [[nodiscard]] static std::string build_path()
+    void run() noexcept
     {
-        std::string p = "/stream?streams=";
-        for (std::size_t i = 0U; i < k_feed_n_instruments; ++i)
+        const int fd = ::open(path_.c_str(), O_RDONLY);
+        if (fd < 0)
         {
-            if (i > 0U) p += '/';
-            p += k_symbols[i];
-            p += "@depth5@100ms";
+            std::fprintf(stderr, "[CsvReplay] cannot open: %s\n", path_.c_str());
+            metrics_.finished.store(true, std::memory_order_release);
+            return;
         }
-        return p;
-    }
 
-    void run_loop() noexcept
-    {
-        while (!shutdown_.load(std::memory_order_acquire))
+        struct stat sb{};
+        if (::fstat(fd, &sb) < 0 || sb.st_size == 0)
         {
-            try { ioc_.restart(); connect_and_stream(); }
-            catch (const std::exception& e) { std::fprintf(stderr, "\n[Feed Error] %s\n", e.what()); metrics_.reconnects.fetch_add(1U, std::memory_order_relaxed); }
+            ::close(fd);
+            metrics_.finished.store(true, std::memory_order_release);
+            return;
+        }
 
-            if (!shutdown_.load(std::memory_order_acquire))
+        const std::size_t file_size = static_cast<std::size_t>(sb.st_size);
+        void* mapped = ::mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+        ::close(fd);
+
+        if (mapped == MAP_FAILED)
+        {
+            std::fprintf(stderr, "[CsvReplay] mmap failed\n");
+            metrics_.finished.store(true, std::memory_order_release);
+            return;
+        }
+
+        ::madvise(mapped, file_size, MADV_SEQUENTIAL);
+
+        const char* p   = static_cast<const char*>(mapped);
+        const char* end = p + file_size;
+
+        std::uint64_t prev_ts = 0U;
+        const std::uint64_t throttle_gap_ns = (cfg_.mode == ReplayMode::Throttled)
+            ? (1'000'000'000ULL / std::max(cfg_.msgs_per_sec, 1U)) : 0ULL;
+
+        while (p < end && !shutdown_.load(std::memory_order_acquire))
+        {
+            if (detail::is_header(p, end)) { p = detail::skip_line(p, end); continue; }
+
+            std::uint64_t ts_ns    = 0U;
+            std::uint32_t instr_id = 0U;
+            float bid_price = 0.0F, bid_qty = 0.0F;
+            float ask_price = 0.0F, ask_qty = 0.0F;
+
+            p = detail::parse_u64  (p, end, ts_ns);     p = detail::skip_comma(p, end);
+            p = detail::parse_u32  (p, end, instr_id);  p = detail::skip_comma(p, end);
+            p = detail::parse_float(p, end, bid_price);  p = detail::skip_comma(p, end);
+            p = detail::parse_float(p, end, bid_qty);    p = detail::skip_comma(p, end);
+            p = detail::parse_float(p, end, ask_price);  p = detail::skip_comma(p, end);
+            p = detail::parse_float(p, end, ask_qty);
+            p = detail::skip_line(p, end);
+
+            if (bid_price == 0.0F || ask_price == 0.0F || instr_id >= k_max_instruments)
             {
-                struct timespec req{2, 0};
-                nanosleep(&req, nullptr);
+                metrics_.parse_errors.fetch_add(1U, std::memory_order_relaxed);
+                continue;
             }
-        }
-    }
 
-    void connect_and_stream()
-    {
-        namespace beast     = boost::beast;
-        namespace websocket = beast::websocket;
-        namespace asio      = boost::asio;
-        namespace ssl       = asio::ssl;
+            metrics_.rows_read.fetch_add(1U, std::memory_order_relaxed);
 
-        ssl::context ssl_ctx{ssl::context::tlsv12_client};
-        ssl_ctx.set_default_verify_paths();
-
-        asio::ip::tcp::resolver resolver{ioc_};
-        const auto results = resolver.resolve(
-            std::string{k_ws_host}, std::string{k_ws_port});
-
-        // FIX: use Beast's ssl_stream<tcp_stream> — correct Beast 1.79+ type
-        using WsStream = websocket::stream<beast::ssl_stream<beast::tcp_stream>>;
-        WsStream ws{ioc_, ssl_ctx};
-
-        beast::get_lowest_layer(ws).connect(results);
-
-        // FIX: set SSL SNI before handshake — required by stream.binance.com
-        if (!SSL_set_tlsext_host_name(
-                ws.next_layer().native_handle(),
-                k_ws_host.data()))
-        {
-            throw boost::system::system_error{
-                static_cast<int>(::ERR_get_error()),
-                boost::asio::error::get_ssl_category()};
-        }
-
-        ws.next_layer().handshake(ssl::stream_base::client);
-
-        ws.set_option(websocket::stream_base::decorator(
-            [](websocket::request_type& req)
-            { req.set(boost::beast::http::field::user_agent, "holographic-engine/0.4"); }));
-
-        ws.handshake(std::string{k_ws_host}, build_path());
-
-        beast::flat_buffer buf;
-        buf.reserve(k_max_frame_bytes);
-
-        while (!shutdown_.load(std::memory_order_acquire))
-        {
-            ws.read(buf);
-            const std::string_view sv{
-                static_cast<const char*>(buf.data().data()),
-                buf.data().size()};
-            parse_and_enqueue(sv);
-            buf.consume(buf.size());
-        }
-
-        beast::error_code ec;
-        ws.close(websocket::close_code::normal, ec);
-    }
-
-    void parse_and_enqueue(std::string_view raw) noexcept
-    {
-        // FIX: boost::json with monotonic_resource → zero heap on steady state
-        try
-        {
-            boost::json::monotonic_resource mr;
-            const boost::json::value jv = boost::json::parse(raw, &mr);
-            const auto& obj = jv.as_object();
-
-            const auto* sv = obj.if_contains("stream");
-            const auto* dv = obj.if_contains("data");
-            if (!sv || !dv) return;
-
-            const std::string_view stream_name{sv->as_string()};
-            const std::uint32_t instr_id = detail::instrument_id_from_stream(stream_name);
-            if (instr_id >= k_feed_n_instruments) return;
-
-            const auto& data = dv->as_object();
-            const auto* bv   = data.if_contains("b");
-            const auto* av   = data.if_contains("a");
-            if (!bv || !av) return;
-
-            metrics_.msgs_received.fetch_add(1U, std::memory_order_relaxed);
-            metrics_.per_instrument_msgs[instr_id].fetch_add(1U, std::memory_order_relaxed);
-
-            // FIX: use now_ns via rdtsc proxy — cheaper than steady_clock
-            const std::uint64_t ts = static_cast<std::uint64_t>(
-                std::chrono::steady_clock::now().time_since_epoch().count());
-
-            const auto push_levels = [&](const boost::json::array& levels, Side side)
+            if (cfg_.mode == ReplayMode::Realtime && prev_ts != 0U && ts_ns > prev_ts)
             {
-                const std::size_t n = std::min(levels.size(),
-                    static_cast<std::size_t>(k_max_depth));
-                for (std::size_t lvl = 0U; lvl < n; ++lvl)
+                const std::uint64_t gap = ts_ns - prev_ts;
+                const std::uint64_t cap = static_cast<std::uint64_t>(cfg_.max_gap_ms) * 1'000'000ULL;
+                const std::uint64_t sl  = (gap < cap) ? gap : cap;
+                if (sl > 100'000ULL)
                 {
-                    const auto& entry = levels[lvl].as_array();
-                    if (entry.size() < 2U) continue;
-
-                    LobUpdate u{};
-                    u.timestamp_ns  = ts;
-                    u.instrument_id = instr_id;
-                    u.depth_level   = static_cast<std::uint8_t>(lvl);
-                    u.side          = side;
-                    // FIX: use fast locale-free parser instead of std::stod
-                    u.price    = detail::parse_price(entry[0].as_string());
-                    u.quantity = detail::parse_price(entry[1].as_string());
-
-                    if (!ring_.try_push(u)) [[unlikely]]
-                        metrics_.msgs_dropped.fetch_add(1U, std::memory_order_relaxed);
+                    struct timespec req{ static_cast<time_t>(sl / 1'000'000'000ULL),
+                                        static_cast<long>  (sl % 1'000'000'000ULL) };
+                    ::nanosleep(&req, nullptr);
                 }
-            };
+            }
+            else if (cfg_.mode == ReplayMode::Throttled && throttle_gap_ns > 0U)
+            {
+                struct timespec req{ static_cast<time_t>(throttle_gap_ns / 1'000'000'000ULL),
+                                     static_cast<long>  (throttle_gap_ns % 1'000'000'000ULL) };
+                ::nanosleep(&req, nullptr);
+            }
 
-            push_levels(bv->as_array(), Side::Bid);
-            push_levels(av->as_array(), Side::Ask);
+            prev_ts = ts_ns;
+
+            LobUpdate bid{};
+            bid.timestamp_ns  = ts_ns;
+            bid.instrument_id = instr_id;
+            bid.depth_level   = 0U;
+            bid.side          = BookSide::Bid;
+            bid.price         = bid_price;
+            bid.quantity      = bid_qty;
+
+            LobUpdate ask{};
+            ask.timestamp_ns  = ts_ns;
+            ask.instrument_id = instr_id;
+            ask.depth_level   = 0U;
+            ask.side          = BookSide::Ask;
+            ask.price         = ask_price;
+            ask.quantity      = ask_qty;
+
+            if (ring_.try_push(bid)) [[likely]]
+                metrics_.updates_pushed.fetch_add(1U, std::memory_order_relaxed);
+            else
+                metrics_.updates_dropped.fetch_add(1U, std::memory_order_relaxed);
+
+            if (ring_.try_push(ask)) [[likely]]
+                metrics_.updates_pushed.fetch_add(1U, std::memory_order_relaxed);
+            else
+                metrics_.updates_dropped.fetch_add(1U, std::memory_order_relaxed);
         }
-        catch (...)
-        {
-            metrics_.parse_errors.fetch_add(1U, std::memory_order_relaxed);
-        }
+
+        ::munmap(mapped, file_size);
+        metrics_.finished.store(true, std::memory_order_release);
     }
 
-    RingT&                  ring_;
-    std::atomic<bool>       shutdown_;
-    boost::asio::io_context ioc_{1};
-    std::thread             worker_;
-    FeedMetrics             metrics_;
+    RingT&            ring_;
+    std::string       path_;
+    ReplayConfig      cfg_;
+    std::atomic<bool> shutdown_{false};
+    std::thread       worker_;
+    ReplayMetrics     metrics_;
 };
 
 } // namespace holo::net

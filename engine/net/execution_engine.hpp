@@ -246,6 +246,56 @@ public:
         std::cerr << "[ExecutionEngine] circuit breaker manually reset — resuming signal processing.\n";
     }
 
+    // Externally triggerable halt for events that don't flow through
+    // dispatch_update() (which only sees order-level events). Intended
+    // caller: an account-stream MARGIN_CALL handler (see
+    // UserDataFeed::set_margin_call_callback) — a margin call is urgent
+    // enough that it should stop new signal processing immediately,
+    // independent of whether any individual order has been rejected.
+    // Same flag as the reject-based breaker above, so is_halted() /
+    // reset_halt() apply uniformly regardless of which guard tripped.
+    void force_halt(std::string_view reason) {
+        if (!halted_.exchange(true, std::memory_order_acq_rel)) {
+            std::cerr << "[ExecutionEngine] HALTED externally: " << reason << "\n";
+        }
+    }
+
+    // -- PnL drawdown kill-switch --------------------------------------------
+    // The reject-based circuit breaker only catches "orders are bouncing".
+    // It does nothing if orders fill successfully but the strategy is
+    // simply losing money (stale/decayed signal, adverse selection, a bad
+    // fee assumption, etc.) — this closes that gap.
+    //
+    // Tracks a high-water mark of total (realized + unrealized) PnL and
+    // trips the same halted_ flag once drawdown from that peak reaches
+    // max_drawdown_usd. This does not compute PnL itself (that needs a
+    // mark-price function only the caller has, e.g. from the live LOB) —
+    // call it periodically with a fresh PnlBook::total_pnl(...) value, for
+    // example from the same background thread that already logs PnL.
+    //
+    // Peak tracking means this is a drawdown limit, not an absolute floor:
+    // a strategy that made +$5,000 and gives back $1,000 trips a $1,000
+    // limit exactly the same as one that went straight to -$1,000 from
+    // zero. If you want an absolute floor instead, pass a fixed peak of
+    // 0.0 by calling this only on the way past a manually-tracked ceiling
+    // — the high-water-mark behavior here is the more common choice for a
+    // running strategy and is what most callers want by default.
+    void check_drawdown(double current_total_pnl, double max_drawdown_usd) {
+        double prev_peak = pnl_high_water_mark_.load(std::memory_order_relaxed);
+        if (current_total_pnl > prev_peak) {
+            pnl_high_water_mark_.store(current_total_pnl, std::memory_order_relaxed);
+            prev_peak = current_total_pnl;
+        }
+        const double drawdown = prev_peak - current_total_pnl;
+        if (drawdown >= max_drawdown_usd && !halted_.exchange(true, std::memory_order_acq_rel)) {
+            std::cerr << "[ExecutionEngine] *** PNL DRAWDOWN KILL-SWITCH TRIPPED *** "
+                      << "peak=" << prev_peak << " current=" << current_total_pnl
+                      << " drawdown=" << drawdown << " >= limit=" << max_drawdown_usd
+                      << " — halting all new signal processing. Investigate before "
+                         "calling reset_halt().\n";
+        }
+    }
+
     // Entry point called by your signal generator. Registers both legs in
     // the OMS, creates per-order waiter channels *before* sending (see
     // race-condition note (1) at the top of this file), fires both GTX
@@ -743,6 +793,7 @@ private:
     std::size_t max_open_orders_;
     std::atomic<bool> halted_{false};
     std::atomic<int> consecutive_rejects_{0};
+    std::atomic<double> pnl_high_water_mark_{0.0};
 
     // Throttled-log state — one pair of atomics per distinct drop reason so
     // a burst of one kind (e.g. capacity) never eats the log budget meant
