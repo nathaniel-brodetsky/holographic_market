@@ -141,6 +141,7 @@ struct OrderRecord {
     double      qty{0.0};
     double      filled_qty{0.0};
     double      avg_fill_price{0.0};
+    double      cumulative_commission{0.0};  // running total, accumulated across events (see apply_update)
     int64_t     exchange_order_id{0};
     int64_t     created_ns{0};       // wall-clock (epoch) — for logs/display
     int64_t     updated_ns{0};       // wall-clock (epoch) — for logs/display
@@ -231,12 +232,21 @@ public:
     // about — Binance's user-data stream is itself ordered per-symbol, so
     // this rarely needs defending against out-of-order delivery, but we
     // never let filled_qty go backwards on a stale/duplicate event.
+    //
+    // `commission_delta` is DIFFERENT in kind from `cumulative_filled_qty`:
+    // Binance's "n" field is the commission charged for *this specific*
+    // execution report, not a running total — unlike "z", there is no
+    // cumulative-commission field in Binance's payload at all. This
+    // parameter must therefore be added to rec.cumulative_commission, never
+    // used to overwrite it. Pass 0.0 for updates that carry no fill (e.g. a
+    // local reject synthesized before any exchange ack).
     bool apply_update(uint64_t key,
                        OrderStatus new_status,
                        double cumulative_filled_qty,
                        double last_fill_price,
                        int64_t exchange_order_id,
-                       int64_t event_ns) {
+                       int64_t event_ns,
+                       double commission_delta = 0.0) {
         std::unique_lock lk(mtx_);
         auto it = index_.find(key);
         if (it == index_.end()) return false;
@@ -252,6 +262,7 @@ public:
             // fill price on this particular event) — still advance qty.
             rec.filled_qty = cumulative_filled_qty;
         }
+        if (commission_delta > 0.0) rec.cumulative_commission += commission_delta;
         rec.status            = new_status;
         rec.exchange_order_id = exchange_order_id;
         rec.updated_ns         = event_ns;

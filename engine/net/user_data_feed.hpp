@@ -222,16 +222,22 @@ private:
         std::string_view l_price_str;  // last fill price, absent/"0" if no fill on this event
         auto _l_err = o["L"].get(l_price_str); (void)_l_err;
 
+        std::string_view commission_str;  // commission for THIS event only — Binance sends no
+                                           // cumulative-commission field, unlike "z" for qty.
+        auto _n_err = o["n"].get(commission_str); (void)_n_err;
+
         int64_t t_ms = 0;
         auto _t_err = o["T"].get(t_ms); (void)_t_err;
         const int64_t event_ns = t_ms * 1'000'000;
 
-        const double cum_filled = svtod(z_str);
-        const double last_px    = l_price_str.empty() ? 0.0 : svtod(l_price_str);
+        const double cum_filled      = svtod(z_str);
+        const double last_px         = l_price_str.empty() ? 0.0 : svtod(l_price_str);
+        const double commission_delta = commission_str.empty() ? 0.0 : svtod(commission_str);
         const OrderStatus status = map_status(status_str);
         const uint64_t key = fnv1a64(client_id);
 
-        if (!oms_.apply_update(key, status, cum_filled, last_px, exch_order_id, event_ns)) {
+        if (!oms_.apply_update(key, status, cum_filled, last_px, exch_order_id, event_ns,
+                                commission_delta)) {
             // Not necessarily a bug: this fires for any client_order_id
             // this OMS instance didn't itself register (e.g. an order
             // placed manually on the exchange UI, or from a previous
