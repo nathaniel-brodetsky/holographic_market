@@ -10,7 +10,8 @@ A bare-metal GPU execution engine for **topological arbitrage detection** in liv
 
 **Phase I** — zero-allocation C++20 execution kernel, 64-byte aligned SPSC ring buffer.  
 **Phase II** — CUDA topological pipeline: normalized Laplacian → LOBPCG Fiedler vector → Hodge-De Rham decomposition → Yang-Mills curvature extraction.  
-**Phase III** *(current)* — live Binance L2 WebSocket feed handler (implemented, wired in). cuML DBSCAN on-device regime clustering is scaffolded (`engine/ai/cuml_clustering.{cu,cuh}`, `TopologyClusterer`) but **not yet implemented** — every method is currently an empty stub, and the class is not instantiated anywhere in `main_live.cpp`/`main_backtest.cpp`/`cuda_pipeline.cu`. The live pipeline currently runs stages ①–⑤ only (Laplacian → LOBPCG → Hodge decomposition → signal extraction); stage ⑥ below is a design target, not a running component.
+**Phase III** — live Binance L2 WebSocket feed handler (implemented, wired in). cuML DBSCAN on-device regime clustering is scaffolded (`engine/ai/cuml_clustering.{cu,cuh}`, `TopologyClusterer`) but **not yet implemented** — every method is currently an empty stub, and the class is not instantiated anywhere in `main_live.cpp`/`main_backtest.cpp`/`cuda_pipeline.cu`. The live pipeline currently runs stages ①–⑤ only (Laplacian → LOBPCG → Hodge decomposition → signal extraction); stage ⑥ below is a design target, not a running component.  
+**Phase IV** *(current)* — live execution engine / maker OMS (`engine/net/execution_engine.hpp`, `oms_core.hpp`, `binance_gateway.hpp`, `user_data_feed.hpp`), talking to **Binance Futures Testnet** (`testnet.binancefuture.com`) via WebSocket order routing. Includes authoritative order-state tracking from the User Data Stream (incl. a margin-call callback), a reject-burst circuit breaker plus a separate PnL drawdown kill-switch (`check_drawdown`), and a legging risk manager that waits a fixed 50ms (`kLegTimeout`) for the resting leg to fill before hedging the remainder at market (`hedge_remaining`). This is wired into `main_live.cpp` against the exchange testnet — it has not been run against mainnet or with real capital.
 
 ---
 
@@ -124,33 +125,50 @@ $$\text{DBSCAN}(\varepsilon, m_{\min}): \mathbb{R}^{|W| \times 4} \to \{-1, 0, 1
 ```
 holographic_market/
 ├── infra/
-│   └── provision.sh          # Idempotent VM bootstrap (Ubuntu 22.04)
-├── cpp_engine/
+│   ├── provision.sh                      # Idempotent VM bootstrap (Ubuntu)
+│   ├── provision_ubuntu.sh / provision_fedora.sh
+│   ├── download_binance_aggtrades.py / _v2.py   # AggTrades → LOB CSV downloader
+│   ├── download_binance_data.py
+│   ├── download_historical_range.sh / _v2.sh
+│   ├── build_sharpe_grid.sh / _v2.sh     # Parameter-sweep backtest runner
+│   ├── run_wfo.sh                        # Walk-forward optimization driver
+│   ├── plot_backtest.py                  # PnL / drawdown chart → data/backtest_chart.png
+│   └── quant_tearsheet.py                # PDF tear sheet → data/Institutional_Tear_Sheet.pdf
+├── engine/                               # C++20 / CUDA engine (was `cpp_engine/`)
 │   ├── CMakeLists.txt
-│   ├── include/
+│   ├── app/
+│   │   ├── main_backtest.cpp             # CSV backtest entrypoint
+│   │   └── main_live.cpp                 # Live engine entrypoint (Binance Futures Testnet)
+│   ├── core/
 │   │   ├── lob_core.hpp
 │   │   ├── lockfree_ring_buffer.hpp
 │   │   ├── memory_arena.hpp
-│   │   ├── cuda_pipeline.cuh
+│   │   └── backtest_stats.hpp
+│   ├── math/                             # Phase II: topological pipeline
+│   │   ├── cuda_pipeline.cu / .cuh
 │   │   ├── cuda_utils.cuh
-│   │   ├── gpu_lob_mirror.cuh
-│   │   ├── hodge_kernel.cuh
-│   │   ├── lobpcg_solver.cuh
-│   │   ├── binance_feed.hpp      # Phase III: WebSocket feed handler
-│   │   └── cuml_clustering.cuh   # Phase III: DBSCAN topology clusterer
-│   ├── src/
-│   │   ├── main.cpp
-│   │   ├── cuda_pipeline.cu
 │   │   ├── gpu_lob_mirror.cu
-│   │   ├── hodge_kernel.cu
-│   │   ├── lobpcg_solver.cu
-│   │   └── cuml_clustering.cu    # Phase III
-│   └── third_party/
-│       └── fast_float/           # Vendored by provision.sh
-├── src/
+│   │   ├── hodge_kernel.cu / .cuh
+│   │   ├── lobpcg_solver.cu / .cuh
+│   │   └── floer_homology.cu / .cuh
+│   ├── net/                              # Phase III/IV: feed + execution
+│   │   ├── binance_feed.hpp              # Phase III: L2 WebSocket feed handler
+│   │   ├── binance_gateway.hpp           # Phase IV: WS-API order routing
+│   │   ├── user_data_feed.hpp            # Phase IV: authoritative order/margin state
+│   │   ├── oms_core.hpp                  # Phase IV: order/position bookkeeping
+│   │   ├── execution_engine.hpp          # Phase IV: legging risk mgr, circuit breaker
+│   │   ├── signal_router.hpp
+│   │   ├── csv_replay.hpp                # Backtest feed replay
+│   │   └── symbols.hpp                   # k_feed_n_instruments = 4
+│   └── ai/
+│       └── cuml_clustering.cu / .cuh     # Phase III: DBSCAN — STUB, not implemented
+├── research/
+│   └── analyze_wfo.py                    # Walk-forward optimization analysis
+├── src/                                  # Python research (gauge-theory prototyping)
 │   ├── gauge_theory_alpha.py
 │   ├── spectral_pruning.py
 │   └── tensor_compression.py
+├── CUDA_SETUP.md                         # nvcc / PATH / cuML troubleshooting
 ├── DEPENDENCIES.md
 ├── requirements.txt
 ├── run_research.py
@@ -166,24 +184,41 @@ holographic_market/
 git clone https://github.com/<org>/holographic_market.git
 cd holographic_market/engine
 
-# 2. Configure + build (Release, Ninja, GCC 12, CUDA archs for T4/A100/RTX30xx/L4/L40S)
+# 2. Configure + build (Release; CUDA archs for T4/A100/RTX30xx/L4/L40S)
+# If nvcc/CUDA isn't on your PATH, see CUDA_SETUP.md first.
+# CMAKE_CUDA_ARCHITECTURES defaults to 89 if unset — override for your GPU
+# (T4=75, A100=80, RTX30xx/L4=86, L40S/RTX40xx=89).
 rm -rf build/
-cmake -B build -G Ninja \
+cmake -B build \
     -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_C_COMPILER=gcc-12 \
-    -DCMAKE_CXX_COMPILER=g++-12 \
-    -DCMAKE_CUDA_HOST_COMPILER=g++-12 \
     -DCMAKE_CUDA_ARCHITECTURES="75;80;86;89" \
+    -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc \
     -DBOOST_ROOT=/usr/local \
     -DBoost_NO_SYSTEM_PATHS=ON
 
 cmake --build build --parallel $(nproc)
 
-# 3a. Run the CSV backtest
-./build/bin/holographic_backtest ../data/test_data.csv
+# 3. Get test data — downloads Binance AggTrades for the given date into
+#    data/test_data.csv (see infra/download_binance_aggtrades_v2.py --help
+#    for --out, --symbols, --chunksize, --max-retries, --no-checksum)
+cd ..
+python3 infra/download_binance_aggtrades_v2.py --date 2024-01-01
 
-# 3b. Run the live engine (Binance L2 feed + paper execution, Phase IV+V)
-./build/bin/holographic_live
+# 4a. Run the CSV backtest
+#     --mode {fastest|realtime|throttled} (default fastest), --gpu-device <N> (default 0),
+#     --out-dir <path> for advanced_metrics.csv (default ../data)
+./engine/build/bin/holographic_backtest data/test_data.csv --mode fastest --gpu-device 0
+
+# 4b. Generate charts / tear sheet from the backtest output
+python3 infra/plot_backtest.py        # → data/backtest_chart.png
+python3 infra/quant_tearsheet.py      # → data/Institutional_Tear_Sheet.pdf
+
+# 5. Run the live engine (Phase IV — Binance Futures TESTNET, not mainnet)
+# Requires:
+export HOLO_API_KEY=...
+export HOLO_API_SECRET=...
+# Optional overrides: HOLO_ORDER_SIZE_USD, HOLO_MAX_POSITION_USD, HOLO_MAX_DRAWDOWN_USD
+./engine/build/bin/holographic_live
 ```
 
 ### Optional CMake flags
@@ -223,7 +258,7 @@ See [`DEPENDENCIES.md`](DEPENDENCIES.md) for the full manifest.
 
 **Remaining requirements for submission:**
 
-1. Real market data validation (Binance WebSocket) ← **WS feed handler implemented and wired in; currently configured for N = 4 instruments (`k_feed_n_instruments` in `binance_feed.hpp`), not the N ≥ 100 target — and this item does not include the DBSCAN regime-clustering stage, which is unimplemented (see III.5)**
+1. Real market data validation (Binance WebSocket) ← **WS feed handler and the Phase IV maker OMS/execution engine are implemented and wired in against Binance Futures Testnet, currently configured for N = 4 instruments (`k_feed_n_instruments` in `engine/net/symbols.hpp`), not the N ≥ 100 target. Testnet only — not yet run against mainnet or real capital. This item does not include the DBSCAN regime-clustering stage, which remains unimplemented (see III.5).**
 2. Statistical backtest: Sharpe ratio of harmonic-flow-ranked portfolios vs. benchmark
 3. Comparison with PCA-based cross-impact models
 4. Formal discrete proof of Arbitrage-Curvature Correspondence
