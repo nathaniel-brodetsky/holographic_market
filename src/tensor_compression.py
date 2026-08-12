@@ -52,36 +52,70 @@ def _generate_mock_lob_tensor(config: LOBCompressionConfig) -> NDArray[np.float3
     return tensor.astype(np.float32)
 
 
-def _left_canonical_svd_sweep(
-        chain: NDArray[np.float32],
+def _tt_svd_sweep(
+        tensor: NDArray[np.float32],
         chi: int,
         threshold: float,
-) -> tuple[MPSNodes, BondDimensions]:
+) -> tuple[MPSNodes, BondDimensions, float]:
+    """Canonical left-to-right TT-SVD (Oseledets, 2011) over the tensor's own
+    axes — for `tensor` of shape (n_0, n_1, ..., n_{d-1})`, this produces `d`
+    cores G_0, ..., G_{d-1} with G_k of shape (r_k, n_k, r_{k+1}), r_0 = r_d = 1.
+
+    IMPORTANT — this replaces the previous `_left_canonical_svd_sweep`, which
+    treated each row of a pre-flattened (n_instruments, depth*sides) matrix as
+    one "site". That construction was not a valid TT/MPS decomposition: a
+    flattened 2D matrix's rows have no joint multi-axis structure for a bond
+    dimension to grow across, so every SVD in that sweep was necessarily rank
+    <= 1 by shape alone (SVD of a (1, N) row matrix has exactly one singular
+    value) — `bond_dimension` (chi) could never have any effect, at any value.
+    The fix is not a tweak to the combination step; it's decomposing along the
+    tensor's actual axes (here: instrument, depth level, side), which is what
+    "sites" means in a tensor train / MPS decomposition. n_sites is now
+    len(tensor.shape) (3 for the LOB tensor), not n_instruments.
+
+    Returns (nodes, bond_dims, dropped_energy_sq) — dropped_energy_sq is the
+    running sum of squared singular values discarded at each unfolding; the
+    standard TT-SVD error bound is ||T - T_tt||_F <= sqrt(dropped_energy_sq)
+    (Oseledets 2011, Theorem 2.2). This is an exact, unfold-native bound (not
+    an approximation), unlike the previous docstring's proxy claim.
+    """
     tn.set_default_backend("numpy")
-    n_sites: int = chain.shape[0]
-    phys_dim: int = chain.shape[1]
+    shape: tuple[int, ...] = tensor.shape
+    n_sites: int = len(shape)
     nodes: MPSNodes = []
     bond_dims: BondDimensions = [1]
-    current_matrix: NDArray[np.float32] = chain[0].reshape(1, phys_dim)
+    dropped_energy_sq: float = 0.0
+
+    # `carry` starts as the full tensor reshaped to 2D: (r_prev * n_site, rest).
+    carry: NDArray[np.float32] = tensor.reshape(1 * shape[0], -1).astype(np.float32)
+    r_prev: int = 1
 
     for site in range(n_sites - 1):
-        u, s, vt = np.linalg.svd(current_matrix, full_matrices=False)
-        rank: int = max(min(int(np.sum(s > threshold)), chi), 1)
-        s_trunc: NDArray[np.float32] = s[:rank].astype(np.float32)
+        n_site: int = shape[site]
+        u, s, vt = np.linalg.svd(carry, full_matrices=False)
+        rank: int = max(min(int(np.sum(s > threshold)), chi, u.shape[1]), 1)
+
+        dropped_energy_sq += float(np.sum(np.square(s[rank:], dtype=np.float64)))
+
         u_trunc: NDArray[np.float32] = u[:, :rank].astype(np.float32)
+        s_trunc: NDArray[np.float32] = s[:rank].astype(np.float32)
         vt_trunc: NDArray[np.float32] = vt[:rank, :].astype(np.float32)
 
-        node: tn.Node = tn.Node(u_trunc.reshape(current_matrix.shape[0], rank), name=f"A_{site}")
-        nodes.append(node)
+        core: NDArray[np.float32] = u_trunc.reshape(r_prev, n_site, rank)
+        nodes.append(tn.Node(core, name=f"G_{site}"))
         bond_dims.append(rank)
 
-        sv_matrix: NDArray[np.float32] = np.diag(s_trunc) @ vt_trunc
-        next_row: NDArray[np.float32] = chain[site + 1].reshape(1, phys_dim).astype(np.float32)
-        current_matrix = sv_matrix * next_row
+        # Carry S@V into the next unfolding: shape (rank * n_{site+1}, rest_after).
+        remaining: NDArray[np.float32] = (np.diag(s_trunc) @ vt_trunc).astype(np.float32)
+        next_n: int = shape[site + 1]
+        rest: int = remaining.size // (rank * next_n)
+        carry = remaining.reshape(rank * next_n, rest)
+        r_prev = rank
 
-    nodes.append(tn.Node(current_matrix.astype(np.float32), name=f"A_{n_sites - 1}"))
+    last_core: NDArray[np.float32] = carry.reshape(r_prev, shape[-1], 1)
+    nodes.append(tn.Node(last_core, name=f"G_{n_sites - 1}"))
     bond_dims.append(1)
-    return nodes, bond_dims
+    return nodes, bond_dims, dropped_energy_sq
 
 
 class LOBTensorTrain:
@@ -96,16 +130,22 @@ class LOBTensorTrain:
                 lob_tensor = _generate_mock_lob_tensor(self._config)
 
             original_bytes: int = lob_tensor.nbytes
-            chain: NDArray[np.float32] = lob_tensor.reshape(self._config.n_instruments, -1)
 
-            nodes, bond_dims = _left_canonical_svd_sweep(
-                chain,
+            nodes, bond_dims, dropped_energy_sq = _tt_svd_sweep(
+                lob_tensor,
                 self._config.bond_dimension,
                 self._config.svd_truncation_threshold,
             )
 
             compressed_bytes: int = sum(n.tensor.nbytes for n in nodes)
             ratio: float = original_bytes / max(compressed_bytes, 1)
+
+            tensor_norm: float = float(np.linalg.norm(lob_tensor))
+            # Oseledets TT-SVD error bound (exact for this construction, not a
+            # proxy): ||T - T_tt||_F <= sqrt(dropped_energy_sq).
+            frob_error: float = (
+                float(np.sqrt(dropped_energy_sq) / tensor_norm) if tensor_norm > 0.0 else 0.0
+            )
 
             self._result = MPSResult(
                 nodes=nodes,
@@ -114,7 +154,7 @@ class LOBTensorTrain:
                 compressed_bytes=compressed_bytes,
                 original_bytes=original_bytes,
                 compression_ratio=ratio,
-                frobenius_error=0.01
+                frobenius_error=frob_error,
             )
             gc.collect()
             return self._result

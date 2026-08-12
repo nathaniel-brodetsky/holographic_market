@@ -51,7 +51,7 @@ namespace holo::cuda
         stage_bid_qtys_   = pinned_alloc<float>(n_floats_);
         stage_ask_qtys_   = pinned_alloc<float>(n_floats_);
 
-        // Выделяем память на видеокарте
+        // Allocate device (GPU) memory
         d_bid_prices_ = device_alloc<float>(n_floats_);
         d_ask_prices_ = device_alloc<float>(n_floats_);
         d_bid_qtys_ = device_alloc<float>(n_floats_);
@@ -129,7 +129,7 @@ namespace holo::cuda
         stage_snapshot();
 
         const size_t bytes = n_floats_ * sizeof(float);
-        // Асинхронное копирование по шине PCIe без блокировки CPU.
+        // Asynchronous copy over the PCIe bus, without blocking the CPU.
         // Source is now the staging buffer, never LobSoA's live arrays.
         CUDA_CHECK(cudaMemcpyAsync(d_bid_prices_, stage_bid_prices_, bytes, cudaMemcpyHostToDevice, stream_));
         CUDA_CHECK(cudaMemcpyAsync(d_ask_prices_, stage_ask_prices_, bytes, cudaMemcpyHostToDevice, stream_));

@@ -44,6 +44,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <functional>
 #include <iostream>
 #include <string>
 
@@ -90,6 +91,18 @@ public:
     // reconnect, which the backoff loop will do naturally on the next
     // disconnect — or call force_reconnect() below).
     void set_listen_key(std::string key) { listen_key_ = std::move(key); }
+
+    // Called on a MARGIN_CALL account-stream event. This is intentionally
+    // decoupled from OMSCore's order-update callback: a margin call is an
+    // account-level event, not an order-level one, and the caller almost
+    // certainly wants it wired to something like
+    // ExecutionEngine::force_halt() rather than routed through OMS order
+    // tracking. Not set by default — MARGIN_CALL is logged loudly either
+    // way (see handle_message), this is purely for the caller to also
+    // *act* on it.
+    void set_margin_call_callback(std::function<void(std::string_view)> cb) {
+        on_margin_call_ = std::move(cb);
+    }
 
 private:
     asio::awaitable<void> run_with_backoff() {
@@ -175,8 +188,22 @@ private:
             std::cerr << "[UserDataFeed] listenKey expired — reconnecting; make sure your "
                          "REST layer has already pushed a fresh key via set_listen_key().\n";
             return true;
+        } else if (event_type == "MARGIN_CALL") {
+            // Binance sends this when one or more positions are at risk of
+            // liquidation. This is not something to merely log and move
+            // on from — surface it loudly and let the caller decide how to
+            // react (typically: halt new signal processing immediately).
+            std::cerr << "[UserDataFeed] *** MARGIN_CALL received *** — one or more "
+                         "positions are at liquidation risk.\n";
+            if (on_margin_call_) on_margin_call_(std::string_view(data, len));
+        } else if (event_type == "ACCOUNT_UPDATE") {
+            // Routine (balance/position changes from fills, funding,
+            // etc.) — traced rather than silently dropped so an
+            // unexpected pattern (e.g. a position change with no
+            // corresponding ORDER_TRADE_UPDATE we recognize) is at least
+            // visible in logs. Not wired to any action by default.
+            std::cerr << "[UserDataFeed] ACCOUNT_UPDATE received (trace only, not acted on)\n";
         }
-        // ACCOUNT_UPDATE, MARGIN_CALL, etc. can be dispatched here as needed.
         return false;
     }
 
@@ -195,16 +222,22 @@ private:
         std::string_view l_price_str;  // last fill price, absent/"0" if no fill on this event
         auto _l_err = o["L"].get(l_price_str); (void)_l_err;
 
+        std::string_view commission_str;  // commission for THIS event only — Binance sends no
+                                           // cumulative-commission field, unlike "z" for qty.
+        auto _n_err = o["n"].get(commission_str); (void)_n_err;
+
         int64_t t_ms = 0;
         auto _t_err = o["T"].get(t_ms); (void)_t_err;
         const int64_t event_ns = t_ms * 1'000'000;
 
-        const double cum_filled = svtod(z_str);
-        const double last_px    = l_price_str.empty() ? 0.0 : svtod(l_price_str);
+        const double cum_filled      = svtod(z_str);
+        const double last_px         = l_price_str.empty() ? 0.0 : svtod(l_price_str);
+        const double commission_delta = commission_str.empty() ? 0.0 : svtod(commission_str);
         const OrderStatus status = map_status(status_str);
         const uint64_t key = fnv1a64(client_id);
 
-        if (!oms_.apply_update(key, status, cum_filled, last_px, exch_order_id, event_ns)) {
+        if (!oms_.apply_update(key, status, cum_filled, last_px, exch_order_id, event_ns,
+                                commission_delta)) {
             // Not necessarily a bug: this fires for any client_order_id
             // this OMS instance didn't itself register (e.g. an order
             // placed manually on the exchange UI, or from a previous
@@ -221,12 +254,18 @@ private:
         return v;
     }
 
-    static OrderStatus map_status(std::string_view s) noexcept {
+    static OrderStatus map_status(std::string_view s) {
         if (s == "NEW") return OrderStatus::Open;
         if (s == "PARTIALLY_FILLED") return OrderStatus::Partial;
         if (s == "FILLED") return OrderStatus::Filled;
         if (s == "CANCELED" || s == "EXPIRED") return OrderStatus::Canceled;
         if (s == "REJECTED") return OrderStatus::Rejected;
+        // Binance introducing a status we don't recognize should be loud,
+        // not a silent "treat it as still-open forever". Defaulting to Open
+        // is still the safest *behavior* (we don't want to prematurely mark
+        // a genuinely-live order as terminal), but it must not be silent.
+        std::cerr << "[UserDataFeed] unknown order status \"" << s
+                  << "\" — defaulting to Open; Binance API may have changed.\n";
         return OrderStatus::Open;
     }
 
@@ -236,6 +275,7 @@ private:
     std::string listen_key_;
     OMSCore& oms_;
     simdjson::dom::parser parser_;
+    std::function<void(std::string_view)> on_margin_call_;
 };
 
 }  // namespace holo::net

@@ -4,6 +4,7 @@
 #include <math/cuda_pipeline.cuh>
 #include <net/csv_replay.hpp>
 #include <net/signal_router.hpp>
+#include <net/symbols.hpp>
 
 #include <chrono>
 #include <cmath>
@@ -13,6 +14,7 @@
 #include <fstream>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace holo;
@@ -23,10 +25,53 @@ struct CliArgs {
     std::uint32_t throttle_rate{100'000U};
     int           gpu_device{0};
     std::size_t   arena_mb{512U};
+    std::string   out_dir{"../data"};
 };
 
-static CliArgs parse_args(int /*argc*/, char **argv) {
-    CliArgs a; a.csv_path = argv[1]; return a;
+static void print_usage() {
+    std::puts(
+        "Usage: backtest <lob_data.csv> [options]\n"
+        "  --mode <fastest|realtime|throttled>  replay mode (default: fastest)\n"
+        "  --throttle-rate <N>                   msgs/sec, only used with --mode throttled (default: 100000)\n"
+        "  --gpu-device <N>                      CUDA device index (default: 0)\n"
+        "  --arena-mb <N>                         memory arena size in MB (default: 512)\n"
+        "  --out-dir <path>                       where advanced_metrics.csv is written (default: ../data)");
+}
+
+// Was previously ignoring argc entirely and hardcoding argv[1] as the only
+// input — CliArgs had mode/throttle_rate/gpu_device/arena_mb fields that
+// were never actually settable from the command line, always silently
+// using their struct defaults. See holographic_market_AUDIT.md §10.6.
+static CliArgs parse_args(int argc, char **argv) {
+    CliArgs a;
+    a.csv_path = argv[1];
+    for (int i = 2; i < argc; ++i) {
+        const std::string_view arg = argv[i];
+        const bool has_value = (i + 1 < argc);
+        if (arg == "--mode" && has_value) {
+            const std::string_view v = argv[++i];
+            if (v == "fastest") a.mode = ReplayMode::Fastest;
+            else if (v == "realtime") a.mode = ReplayMode::Realtime;
+            else if (v == "throttled") a.mode = ReplayMode::Throttled;
+            else { std::fprintf(stderr, "[ERROR] unknown --mode \"%.*s\"\n",
+                                 static_cast<int>(v.size()), v.data()); print_usage(); std::exit(1); }
+        } else if (arg == "--throttle-rate" && has_value) {
+            a.throttle_rate = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+        } else if (arg == "--gpu-device" && has_value) {
+            a.gpu_device = std::atoi(argv[++i]);
+        } else if (arg == "--arena-mb" && has_value) {
+            a.arena_mb = static_cast<std::size_t>(std::strtoul(argv[++i], nullptr, 10));
+        } else if (arg == "--out-dir" && has_value) {
+            a.out_dir = argv[++i];
+        } else if (arg == "--help" || arg == "-h") {
+            print_usage(); std::exit(0);
+        } else {
+            std::fprintf(stderr, "[ERROR] unrecognized argument \"%.*s\"\n",
+                         static_cast<int>(arg.size()), arg.data());
+            print_usage(); std::exit(1);
+        }
+    }
+    return a;
 }
 
 struct TickRecord {
@@ -86,7 +131,13 @@ struct PnlTracker {
     std::uint64_t           filtered{0U};
     std::uint64_t           prev_signal_ts_ns{0U};
 
-    EwmaPair baselines[16]{};
+    // Sized as k_feed_n_instruments^2 (a full pairwise matrix), not a bare
+    // "16" — previously this, the bounds check below, and the LobSoA/
+    // SignalRouter construction in main() each hardcoded "4" independently;
+    // adding a 5th instrument meant updating all of them by hand, and
+    // missing one would silently out-of-bounds or drop signals instead of
+    // failing loudly. See holographic_market_AUDIT.md §10.5.
+    EwmaPair baselines[holo::net::k_feed_n_instruments * holo::net::k_feed_n_instruments]{};
 
     void record(
         const RoutedEdge               &edge,
@@ -99,11 +150,11 @@ struct PnlTracker {
 
         const std::size_t src = static_cast<std::size_t>(edge.src_instrument);
         const std::size_t dst = static_cast<std::size_t>(edge.dst_instrument);
-        if (src >= 4U || dst >= 4U) return;
+        if (src >= holo::net::k_feed_n_instruments || dst >= holo::net::k_feed_n_instruments) return;
 
         const double log_ratio = std::log(static_cast<double>(mid_dst)
                                         / static_cast<double>(mid_src));
-        EwmaPair &bl = baselines[src * 4U + dst];
+        EwmaPair &bl = baselines[src * holo::net::k_feed_n_instruments + dst];
         const double z_score = bl.update(log_ratio);
 
         if (!bl.warm) return;
@@ -191,7 +242,7 @@ struct PnlTracker {
 };
 
 int main(int argc, char **argv) {
-    if (argc < 2) { std::puts("Usage: backtest <lob_data.csv>"); return 1; }
+    if (argc < 2) { print_usage(); return 1; }
 
     const CliArgs cli = parse_args(argc, argv);
     std::fprintf(stderr, "[CONFIG] HOLO_K_ALPHA effective = %.6f%s\n",
@@ -199,13 +250,13 @@ int main(int argc, char **argv) {
                  std::getenv("HOLO_K_ALPHA") ? " (from env)" : " (default)");
     MemoryArena   arena{cli.arena_mb * 1024UL * 1024UL};
 
-    LobSoA lob_soa{arena, 4U, 1U};
+    LobSoA lob_soa{arena, holo::net::k_feed_n_instruments, 1U};
     DynamicSpscRingBuffer<LobUpdate> ring{arena, 8'388'608U};
     CsvReplayHandler replay{ring, cli.csv_path,
                             ReplayConfig{cli.mode, cli.throttle_rate, 500U}};
     holo::cuda::CudaPipeline gpu_pipeline{lob_soa, arena, cli.gpu_device};
 
-    SignalRouter             router{4U};
+    SignalRouter             router{holo::net::k_feed_n_instruments};
     PnlTracker               pnl;
     SignalRouter::TopKBuffer top_edges{};
 
@@ -279,6 +330,6 @@ int main(int argc, char **argv) {
     const auto &rm = replay.metrics();
     std::printf("  Rows read        : %llu\n", static_cast<unsigned long long>(rm.rows_read.load()));
     std::printf("  Updates dropped  : %llu\n", static_cast<unsigned long long>(rm.updates_dropped.load()));
-    pnl.flush_csv("../data");
+    pnl.flush_csv(cli.out_dir);
     return 0;
 }

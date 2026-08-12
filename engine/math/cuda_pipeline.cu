@@ -291,6 +291,21 @@ namespace holo::cuda
         run_spectral_pruning();
         run_hodge_decomposition();
 
+        // ---- TEMP DIAGNOSTIC: trace pipeline stage reach/exit ----
+        {
+            static int s_diag2_calls = 0;
+            if (s_diag2_calls < 8)
+            {
+                std::fprintf(stderr,
+                    "[DIAG2 %d] laplacian.n_rows=%d laplacian.nnz=%d hodge_ws_.n_edges=%d "
+                    "n_instruments=%u\n",
+                    s_diag2_calls, laplacian_.n_rows, laplacian_.nnz, hodge_ws_.n_edges,
+                    static_cast<unsigned>(lob_soa_.n_instruments()));
+                ++s_diag2_calls;
+            }
+        }
+        // ---- END TEMP DIAGNOSTIC ----
+
         if (hodge_ws_.n_edges > 0)
         {
             ArbitrageSignal sig = extract_arbitrage_signal(hodge_ws_, compute_stream_);

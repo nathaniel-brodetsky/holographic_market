@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <iostream>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
@@ -32,9 +33,27 @@ namespace holo::net {
 // ---------------------------------------------------------------------------
 // Time helpers
 // ---------------------------------------------------------------------------
+// now_ns(): wall-clock (epoch) time. Used where the value needs to mean
+// something outside this process — cross-referenced against Binance's own
+// event timestamps, or written to a human-readable log (see
+// ExecutionEngine's "HALTED at <now_ns()>ns" log and binance_gateway.hpp's
+// reject-path event_ns). Do NOT repurpose this for duration/elapsed-time
+// math — system_clock is not monotonic and can jump (NTP correction),
+// which is exactly the failure mode steady_ns() below exists to avoid.
 inline int64_t now_ns() noexcept {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
                std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+// steady_ns(): monotonic clock, meaningless as a wall-clock timestamp (its
+// epoch is unspecified and arbitrary) but never jumps backward/forward due
+// to clock synchronization. Use this for anything measuring "how long has
+// it been" rather than "what time is it" — e.g. order-age/staleness
+// checks (see OrderRecord::created_mono_ns / get_stale_orders below).
+inline int64_t steady_ns() noexcept {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
         .count();
 }
 
@@ -69,13 +88,29 @@ constexpr double signed_dir(Side s) noexcept { return s == Side::Buy ? 1.0 : -1.
 using SymbolBuf   = std::array<char, 16>;
 using ClientIdBuf = std::array<char, 40>;  // Binance newClientOrderId <= 36 chars
 
-inline SymbolBuf make_symbol(std::string_view sv) noexcept {
+inline SymbolBuf make_symbol(std::string_view sv) {
     SymbolBuf buf{};
+    if (sv.size() > buf.size() - 1) {
+        // Unlike client_order_id (Binance-documented <= 36 chars, buffer is
+        // 40 — comfortable margin), there's no equivalent guarantee for
+        // symbol length here. A silent truncation would hand a *different*,
+        // wrong-but-valid-looking symbol string to the rest of the system
+        // with zero indication anything went wrong.
+        std::cerr << "[OMSCore] WARNING: symbol \"" << sv << "\" (" << sv.size()
+                  << " chars) exceeds SymbolBuf capacity (" << (buf.size() - 1)
+                  << ") — truncating, this WILL corrupt downstream symbol matching.\n";
+    }
     std::memcpy(buf.data(), sv.data(), std::min(sv.size(), buf.size() - 1));
     return buf;
 }
-inline ClientIdBuf make_client_id(std::string_view sv) noexcept {
+inline ClientIdBuf make_client_id(std::string_view sv) {
     ClientIdBuf buf{};
+    if (sv.size() > buf.size() - 1) {
+        std::cerr << "[OMSCore] WARNING: client_order_id \"" << sv << "\" (" << sv.size()
+                  << " chars) exceeds ClientIdBuf capacity (" << (buf.size() - 1)
+                  << ") — truncating, this WILL corrupt order-id round-tripping "
+                     "with the exchange.\n";
+    }
     std::memcpy(buf.data(), sv.data(), std::min(sv.size(), buf.size() - 1));
     return buf;
 }
@@ -106,9 +141,11 @@ struct OrderRecord {
     double      qty{0.0};
     double      filled_qty{0.0};
     double      avg_fill_price{0.0};
+    double      cumulative_commission{0.0};  // running total, accumulated across events (see apply_update)
     int64_t     exchange_order_id{0};
-    int64_t     created_ns{0};
-    int64_t     updated_ns{0};
+    int64_t     created_ns{0};       // wall-clock (epoch) — for logs/display
+    int64_t     updated_ns{0};       // wall-clock (epoch) — for logs/display
+    int64_t     created_mono_ns{0};  // steady_clock — for staleness math only
 
     [[nodiscard]] double remaining_qty() const noexcept { return qty - filled_qty; }
 };
@@ -156,10 +193,28 @@ public:
         rec.qty             = qty;
         rec.created_ns      = now_ns();
         rec.updated_ns      = rec.created_ns;
+        rec.created_mono_ns = steady_ns();
 
         const uint64_t key = fnv1a64(client_order_id);
 
         std::unique_lock lk(mtx_);
+        // A key already present here means either an FNV-1a hash collision
+        // (astronomically unlikely for the monotonically-incrementing
+        // "holo-<seq>" client IDs this OMS is fed in practice) or a caller
+        // bug reusing a client_order_id before release()-ing the previous
+        // order. Either way, silently overwriting index_[key] would orphan
+        // the previous slot: it stays live in slots_ but becomes
+        // unreachable, so its fills/rejects can never be routed to it
+        // again — a real order the OMS quietly stops tracking. Not
+        // something to fail hard on here (this is a hot path called from
+        // the signal loop), but it must not be silent.
+        if (index_.contains(key)) {
+            std::cerr << "[OMSCore] WARNING: client_order_id key collision on "
+                         "register_new_order for \"" << client_order_id
+                      << "\" — overwriting a live index entry; the previous "
+                         "order at that key is now orphaned (its updates will "
+                         "no longer be routed).\n";
+        }
         const size_t slot = alloc_slot_locked();
         slots_[slot] = rec;
         index_[key]  = slot;
@@ -177,12 +232,21 @@ public:
     // about — Binance's user-data stream is itself ordered per-symbol, so
     // this rarely needs defending against out-of-order delivery, but we
     // never let filled_qty go backwards on a stale/duplicate event.
+    //
+    // `commission_delta` is DIFFERENT in kind from `cumulative_filled_qty`:
+    // Binance's "n" field is the commission charged for *this specific*
+    // execution report, not a running total — unlike "z", there is no
+    // cumulative-commission field in Binance's payload at all. This
+    // parameter must therefore be added to rec.cumulative_commission, never
+    // used to overwrite it. Pass 0.0 for updates that carry no fill (e.g. a
+    // local reject synthesized before any exchange ack).
     bool apply_update(uint64_t key,
                        OrderStatus new_status,
                        double cumulative_filled_qty,
                        double last_fill_price,
                        int64_t exchange_order_id,
-                       int64_t event_ns) {
+                       int64_t event_ns,
+                       double commission_delta = 0.0) {
         std::unique_lock lk(mtx_);
         auto it = index_.find(key);
         if (it == index_.end()) return false;
@@ -198,6 +262,7 @@ public:
             // fill price on this particular event) — still advance qty.
             rec.filled_qty = cumulative_filled_qty;
         }
+        if (commission_delta > 0.0) rec.cumulative_commission += commission_delta;
         rec.status            = new_status;
         rec.exchange_order_id = exchange_order_id;
         rec.updated_ns         = event_ns;
@@ -224,11 +289,16 @@ public:
     // per-call heap allocation on a hot stale-order sweep loop.
     void get_stale_orders(int64_t max_age_ns, std::vector<OrderRecord>& out) const {
         out.clear();
-        const int64_t cutoff = now_ns() - max_age_ns;
+        // Monotonic cutoff: an NTP step correction on now_ns() (system_clock)
+        // could otherwise make a genuinely-stuck order look fresh (clock
+        // stepped backward) or a brand-new one look stale (clock stepped
+        // forward) right when the sweeper runs. created_mono_ns/steady_ns()
+        // are immune to that by construction.
+        const int64_t cutoff = steady_ns() - max_age_ns;
         std::shared_lock lk(mtx_);
         for (const auto& [key, slot] : index_) {
             const OrderRecord& rec = slots_[slot];
-            if (is_live(rec.status) && rec.created_ns < cutoff) out.push_back(rec);
+            if (is_live(rec.status) && rec.created_mono_ns < cutoff) out.push_back(rec);
         }
     }
 
