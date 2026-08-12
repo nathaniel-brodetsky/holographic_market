@@ -385,7 +385,7 @@ public:
 
     [[nodiscard]] PnlBook& pnl() noexcept { return pnl_; }
 
-    // "Уборщик" / stale-order sweeper: periodically cancels resting orders
+    // Stale-order sweeper: periodically cancels resting orders
     // older than max_age that haven't reached a terminal state — the
     // scenario monitor_pair() does NOT cover on its own, because its
     // kLegTimeout logic only engages once one leg of a pair has already

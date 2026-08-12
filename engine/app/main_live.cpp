@@ -29,7 +29,7 @@ using namespace holo;
 using namespace holo::cuda;
 using namespace holo::net;
 
-// Функция для получения ListenKey (нужен для User Data Stream)
+// Fetches a ListenKey (required for the User Data Stream)
 std::string fetch_listen_key(const std::string& api_key) {
     namespace beast = boost::beast;
     namespace http = beast::http;
@@ -148,15 +148,15 @@ int main() {
 
     OMSCore oms;
 
-    // UserDataFeed (Слушает исполнение ордеров по WebSocket)
+    // UserDataFeed (listens for order execution updates over WebSocket)
     UserDataFeed ud_feed(ioc.get_executor(), ssl_ctx, "testnet.binancefuture.com", listen_key, oms);
     ud_feed.start();
 
-    // Шлюз отправки ордеров по WebSocket
+    // Order-submission gateway over WebSocket
     BinanceGateway gateway(ioc.get_executor(), ssl_ctx, api_key, api_secret, oms);
     gateway.start();
 
-    // Мозг: Execution Engine
+    // Brain: Execution Engine
     ExecutionEngine exec(ioc.get_executor(), oms, gateway);
     exec.start_stale_order_sweeper();
 
@@ -196,11 +196,10 @@ int main() {
         }
     }};
 
-    // Фоновый поток для логирования профита раз в 5 секунд —
-    // также прогоняет PnL drawdown kill-switch на каждом тике (см.
-    // ExecutionEngine::check_drawdown): reject-based circuit breaker выше
-    // не ловит случай, когда ордера успешно исполняются, но стратегия
-    // просто теряет деньги.
+    // Background thread that logs PnL every 5 seconds — also runs the PnL
+    // drawdown kill-switch on every tick (see ExecutionEngine::check_drawdown):
+    // the reject-based circuit breaker above doesn't catch the case where
+    // orders fill successfully but the strategy is simply losing money.
     std::thread pnl_logger_thread{[&]() {
         while(!shutdown.load(std::memory_order_relaxed)) {
             std::this_thread::sleep_for(std::chrono::seconds(5));
@@ -258,15 +257,15 @@ int main() {
                     std::string sym1 = std::string(k_symbols_upper[edge.src_instrument]);
                     std::string sym2 = std::string(k_symbols_upper[edge.dst_instrument]);
 
-                    // Проверяем лимиты риска из PnlBook — обе ноги
-                    // симметрично. Раньше проверялась только нога 1: вторая
-                    // могла свободно превышать max_position_usd.
+                    // Risk-limit check from PnlBook — both legs,
+                    // symmetrically. Previously only leg 1 was checked:
+                    // leg 2 could freely exceed max_position_usd.
                     double cur_pos1_qty = std::abs(exec.pnl().snapshot(sym1).qty);
                     double cur_pos2_qty = std::abs(exec.pnl().snapshot(sym2).qty);
                     if (cur_pos1_qty * lob_ptr->mid_price(edge.src_instrument) > max_position_usd) continue;
                     if (cur_pos2_qty * lob_ptr->mid_price(edge.dst_instrument) > max_position_usd) continue;
 
-                    // Нога 1 (Лимитка в спред)
+                    // Leg 1 (passive limit order into the spread)
                     ExecutionEngine::ArbLeg leg1{
                         sym1,
                         is_long ? holo::net::Side::Buy : holo::net::Side::Sell,
@@ -274,7 +273,7 @@ int main() {
                         is_long ? lob_ptr->best_bid(edge.src_instrument) : lob_ptr->best_ask(edge.src_instrument)
                     };
 
-                    // Нога 2 (Зеркальная лимитка)
+                    // Leg 2 (mirrored passive limit order)
                     ExecutionEngine::ArbLeg leg2{
                         sym2,
                         is_long ? holo::net::Side::Sell : holo::net::Side::Buy,
@@ -284,7 +283,7 @@ int main() {
 
                     std::cout << "[SIGNAL] S_YM=" << sig.yang_mills_action << " | Placing Maker Limits for " << leg1.symbol << " & " << leg2.symbol << "\n";
 
-                    // Запускаем корутину
+                    // Launch the coroutine
                     boost::asio::co_spawn(ioc, exec.on_signal(leg1, leg2), boost::asio::detached);
                 }
             }
