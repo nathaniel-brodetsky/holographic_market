@@ -1,6 +1,7 @@
 #include <math/lobpcg_solver.cuh>
 #include <math/cuda_utils.cuh>
 #include <cmath>
+#include <cstdio>
 
 namespace holo::cuda
 {
@@ -21,6 +22,9 @@ __global__ void kernel_build_complete_laplacian(
     int* d_row_ptr, int* d_col_idx, float* d_values)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i == 0)
+        printf("[KERNEL DIAG] tid=0 entered, n=%d depth=%d gridDim.x=%d blockDim.x=%d\n",
+               n, depth, gridDim.x, blockDim.x);
     if (i >= n) return;
 
     // Row i: columns 0..n-1, skip self → write in order, diagonal last
@@ -91,8 +95,13 @@ void build_normalized_laplacian(
     kernel_build_complete_laplacian<<<grd, blk, 0, stream>>>(
         d_bid, d_ask, n, static_cast<int>(depth), 1000.0f,
         out.d_row_ptr, out.d_col_idx, out.d_values);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    std::fprintf(stderr, "[HOST DIAG] launched kernel_build_complete_laplacian grd=%d blk=%d n=%d out.d_row_ptr=%p out.d_col_idx=%p out.d_values=%p\n",
+                 grd, blk, n, (void*)out.d_row_ptr, (void*)out.d_col_idx, (void*)out.d_values);
     kernel_normalize_laplacian<<<grd, blk, 0, stream>>>(
         n, out.d_row_ptr, out.d_col_idx, out.d_values);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 void lobpcg_workspace_init(
