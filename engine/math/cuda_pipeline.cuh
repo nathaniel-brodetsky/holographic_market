@@ -10,6 +10,7 @@
 #include <math/lobpcg_solver.cuh>
 #include <math/hodge_kernel.cuh>
 #include <math/floer_homology.cuh>
+#include <ai/cuml_clustering.cuh>
 #include <core/lob_core.hpp>
 #include <core/memory_arena.hpp>
 
@@ -18,6 +19,25 @@ namespace holo::cuda
 
 static constexpr std::uint64_t k_pipeline_poll_ns  = 1'000'000ULL;
 static constexpr std::size_t   k_signal_history_len = 1024U;
+
+// Stage VI (regime clustering) config. Each SignalRecord already IS a
+// per-tick (S_YM, max|γ|, mean|γ|, β₁) feature vector -- yang_mills_action,
+// max_curl, mean_curl, floer_HF1 -- so "building the feature window" is
+// just stacking the last k_cluster_window entries of signal_history_ into
+// an [k_cluster_window x 4] matrix; no new per-window aggregation math is
+// needed beyond what record_signal()/run_floer_pass() already compute.
+//
+// k_cluster_window / k_cluster_refit_every are placeholders, not values
+// pulled from README §III.6 -- tune them against the real budget there:
+// DBSCAN over ~128 points is well under a millisecond on any RTX-class
+// GPU, so the window size is really about how many recent ticks should
+// define a "regime" for your instruments, not a performance constraint.
+// Refitting every 10 new signals (rather than every tick) keeps this off
+// the <1ms per-tick hot path, matching the "async/every-10-cycles DBSCAN
+// path" note in ai/cuml_clustering.cu.
+static constexpr int k_cluster_window       = 128;
+static constexpr int k_cluster_features     = 4; // S_YM, max|γ|, mean|γ|, β₁
+static constexpr std::uint64_t k_cluster_refit_every = 10U;
 
 struct alignas(16) GpuLobSnapshot
 {
@@ -187,6 +207,17 @@ public:
         return signal_history_[read_idx];
     }
 
+    // Copy of the last DBSCAN regime-clustering result (d_labels is the
+    // raw device pointer TopologyClusterer owns internally -- valid until
+    // the next fit() call or this CudaPipeline's destruction, whichever
+    // comes first; callers that need it past that must copy it out
+    // themselves). Default-constructed (n_samples == 0) until the window
+    // has filled and the first fit() has actually run.
+    [[nodiscard]] ClusteringResult last_clustering() const noexcept
+    {
+        return clusterer_ != nullptr ? clusterer_->result() : ClusteringResult{};
+    }
+
 private:
     void init_gpu(int device);
     void transfer_lob_to_gpu();
@@ -194,6 +225,7 @@ private:
     void run_hodge_decomposition();
     void record_signal(const ArbitrageSignal &sig);
     void run_floer_pass(SignalRecord &rec);
+    void build_cluster_window_and_fit();
 
     holo::core::LobSoA &lob_soa_;
 
@@ -222,6 +254,17 @@ private:
 
     SignalRecord              signal_history_[k_signal_history_len]{};
     std::atomic<std::uint64_t> signal_write_idx_{0U};
+
+    // Stage VI: dedicated stream so DBSCAN refits never block
+    // compute_stream_/signal_stream_'s per-tick hot path; owns
+    // clusterer_'s lifetime and must outlive it (see StreamGuard member
+    // order below -- destroyed in reverse declaration order, after
+    // clusterer_ has already been destroyed in ~CudaPipeline()).
+    StreamGuard        cluster_stream_;
+    TopologyClusterer  *clusterer_{nullptr};
+    float              *h_cluster_features_{nullptr}; // pinned, [k_cluster_window x k_cluster_features]
+    float              *d_cluster_features_{nullptr};
+    std::uint64_t       last_cluster_refit_signal_count_{0U};
 
     std::uint64_t last_lob_generation_{0U};
     int           sm_count_{0};

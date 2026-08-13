@@ -23,3 +23,8 @@ data/advanced_metrics.csvdata/
 *.csv
 !infra/*.csv
 multi_day_results.txt
+
+# local dev artifacts, not part of the repo
+/Miniforge3-Linux-x86_64.sh
+/data/
+/engine/simdjson/

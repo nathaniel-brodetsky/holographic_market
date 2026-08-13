@@ -18,10 +18,28 @@ find_library(SIMDJSON_LIB simdjson
     HINTS /usr/lib /usr/local/lib /usr/lib64 /usr/lib/x86_64-linux-gnu)
 
 set(CUML_ROOT "" CACHE PATH "cuML install prefix")
-find_path(CUML_INCLUDE_DIR cuml/cluster/dbscan.hpp
-    HINTS ${CUML_ROOT}/include $ENV{CONDA_PREFIX}/include)
-find_library(CUML_LIB cuml
-    HINTS ${CUML_ROOT}/lib $ENV{CONDA_PREFIX}/lib)
+if(CUML_ROOT)
+    list(APPEND CMAKE_PREFIX_PATH ${CUML_ROOT})
+endif()
+# Deliberately NOT hand-rolling find_path()/find_library() + manual
+# -isystem paths for cuML/rmm/raft/CCCL anymore (see git history / prior
+# discussion for the full story): RAPIDS vendors several parallel,
+# independently-versioned copies of thrust/cub under this one prefix
+# (targets/x86_64-linux/include/cub from the cuda-cccl package,
+# include/rapids/cub from librmm/libraft/libcuml's own isolated overlay,
+# include/libcudf/rapids/cub from libcudf's own separate overlay, plus
+# cupy's vendored copy) -- deliberately, using inline-namespace version
+# tagging so different RAPIDS components can each pin a different CCCL
+# version without ABI collisions. Only cuml's own generated CMake config
+# (which itself calls find_package(rmm CONFIG)/find_package(raft CONFIG)
+# and inherits *their* correct INTERFACE_INCLUDE_DIRECTORIES, in the
+# right order, for the specific CCCL copy each of them was built against)
+# can get this right. Any include path we add by hand risks mixing an
+# incompatible pair of these trees in one translation unit, which doesn't
+# fail cleanly -- it produces a wall of unrelated-looking template errors
+# out of rmm/mr/device/per_device_resource.hpp and a
+# THRUST_VERSION/CUB_VERSION static_assert failure in thrust/version.h.
+find_package(cuml CONFIG QUIET)
 
 include(CheckCXXCompilerFlag)
 include(CheckCXXSourceRuns)
@@ -49,7 +67,21 @@ if(HAS_LTO)
 endif()
 
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR CMAKE_CUDA_ARCHITECTURES STREQUAL "52")
-    set(CMAKE_CUDA_ARCHITECTURES "89" CACHE STRING "CUDA arch" FORCE)
+    # Was hardcoded to 89 (Ada Lovelace: L4/L40/RTX 40-series). PTX/SASS
+    # built for a higher virtual architecture does NOT JIT down to older
+    # hardware -- only forward (same-or-newer). Running arch=89 binaries
+    # on an Ampere A100 (compute capability 8.0) produces exactly the
+    # kind of deferred "named symbol not found (500)" cudaGetLastError()
+    # surfaces here, not a clean "unsupported architecture" error at
+    # kernel launch time.
+    #
+    # 80 = A100/A30 (Ampere, datacenter). If you build for a different
+    # GPU, override explicitly: cmake -B build -DCMAKE_CUDA_ARCHITECTURES=89
+    # (Ada/L4/L40/RTX 40xx), =90 (H100), =86 (RTX 30xx), etc. -- or, on
+    # CMake >=3.24 with CUDA >=11.6, use -DCMAKE_CUDA_ARCHITECTURES=native
+    # to auto-detect whatever GPU is actually present at configure time
+    # instead of hardcoding any single target.
+    set(CMAKE_CUDA_ARCHITECTURES "80" CACHE STRING "CUDA arch" FORCE)
 endif()
 
 add_library(holo_cuda_options INTERFACE)
@@ -82,9 +114,11 @@ set(HOLO_SYSTEM_INCLUDE_DIRS
 if(SIMDJSON_INCLUDE_DIR)
     list(APPEND HOLO_SYSTEM_INCLUDE_DIRS ${SIMDJSON_INCLUDE_DIR})
 endif()
-if(CUML_INCLUDE_DIR)
-    list(APPEND HOLO_SYSTEM_INCLUDE_DIRS ${CUML_INCLUDE_DIR})
-endif()
+# Deliberately nothing cuML/rmm/raft/CCCL-related appended here anymore --
+# that all comes from the cuml::cuml++ imported target (see the
+# find_package(cuml CONFIG) comment above) via target_link_libraries on
+# holo_ai below, which is the only thing that gets the include order
+# right for RAPIDS's several parallel-versioned CCCL trees.
 
 # Helper: attach our own headers as normal (warning-checked) includes and
 # third-party headers as SYSTEM includes, so -Wall/-Wextra/-Wconversion/
@@ -118,13 +152,33 @@ holo_target_includes(holo_ai PUBLIC)
 target_link_libraries(holo_ai PUBLIC
     holo_compile_options holo_cuda_options
     CUDA::cudart)
-if(CUML_LIB)
-    target_link_libraries(holo_ai PUBLIC ${CUML_LIB})
+if(cuml_FOUND)
+    target_link_libraries(holo_ai PUBLIC cuml::cuml++)
     target_compile_definitions(holo_ai PUBLIC HOLO_HAS_CUML=1)
+else()
+    message(STATUS
+        "cuml not found via find_package(cuml CONFIG) -- holo_ai will "
+        "build without HOLO_HAS_CUML (TopologyClusterer::fit() stays a "
+        "no-op, see ai/cuml_clustering.cu). Pass -DCUML_ROOT=<rapids env "
+        "prefix> (e.g. the conda/mamba env prefix, not just its lib/ or "
+        "include/) so find_package can locate "
+        "<prefix>/lib/cmake/cuml/cuml-config.cmake.")
 endif()
 set_target_properties(holo_ai PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     POSITION_INDEPENDENT_CODE ON)
+
+# cuda_pipeline.cu (in holo_math) now instantiates and drives
+# holo::cuda::TopologyClusterer directly (stage VI wiring), so holo_math
+# has a real link-time dependency on holo_ai's symbols -- previously this
+# only worked "by accident" because both static libs happened to get
+# linked together into holographic_live/holographic_backtest. Make it
+# explicit so `cmake --build build --target holo_math` (e.g. for the
+# smoke test) and any future target that links holo_math without also
+# separately listing holo_ai still resolve correctly. holo_ai does not
+# link back to holo_math (it only uses header-only bits of
+# math/cuda_utils.cuh), so this stays a one-directional, acyclic edge.
+target_link_libraries(holo_math PUBLIC holo_ai)
 
 set(HOLO_NET_LINK_LIBS
     Boost::system Boost::json
@@ -137,6 +191,15 @@ if(SIMDJSON_LIB)
 endif()
 
 # ── holographic_live ──────────────────────────────────────────────────────────
+# NOTE: do NOT add BOOST_ASIO_USE_TS_EXECUTOR_AS_DEFAULT here (even as
+# =0). Boost.Asio config macros like this are #ifdef-gated, not #if-gated
+# -- merely *defining* it (any value) forces the legacy TS-style
+# boost::asio::executor as the default executor instead of any_io_executor,
+# which is broken together with experimental::awaitable_operators /
+# parallel_group in Boost 1.84.0: https://github.com/chriskohlhoff/asio/issues/1397
+# ("field has incomplete type 'executor_type' (aka 'void')" in
+# parallel_group.hpp). The code already uses asio::any_io_executor
+# explicitly throughout net/*.hpp; this macro was silently fighting that.
 add_executable(holographic_live app/main_live.cpp)
 holo_target_includes(holographic_live PRIVATE)
 target_link_libraries(holographic_live PRIVATE

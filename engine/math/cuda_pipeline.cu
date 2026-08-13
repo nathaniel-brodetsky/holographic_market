@@ -51,6 +51,24 @@ namespace holo::cuda
         std::memset(h_harmonic_out_, 0, static_cast<size_t>(k_max_edges) * sizeof(float));
         std::memset(h_curl_out_, 0, static_cast<size_t>(k_max_edges) * sizeof(float));
 
+        // Stage VI: fixed-size clustering buffers, allocated once here and
+        // never resized -- same "zero allocations after warmup" contract
+        // TopologyClusterer::ensure_label_buffer() documents for its own
+        // (much smaller) label buffer.
+        h_cluster_features_ = pinned_alloc<float>(
+            static_cast<size_t>(k_cluster_window) * k_cluster_features);
+        d_cluster_features_ = device_alloc<float>(
+            static_cast<size_t>(k_cluster_window) * k_cluster_features);
+        std::memset(h_cluster_features_, 0,
+            static_cast<size_t>(k_cluster_window) * k_cluster_features * sizeof(float));
+
+        ClusteringConfig cluster_cfg;
+        // See ai/cuml_clustering.cu: eps=0.15F default is a placeholder for
+        // real normalized signal data, unverified against a live feed --
+        // revisit once build_cluster_window_and_fit() has actually run on
+        // market-derived (not synthetic) feature vectors.
+        clusterer_ = new TopologyClusterer(cluster_stream_, cluster_cfg);
+
         CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
     }
 
@@ -59,13 +77,29 @@ namespace holo::cuda
         cudaStreamSynchronize(transfer_stream_);
         cudaStreamSynchronize(compute_stream_);
         cudaStreamSynchronize(signal_stream_);
+        cudaStreamSynchronize(cluster_stream_);
+
+        // clusterer_ must be torn down before cluster_stream_ (a member
+        // below it, but that's not what saves us here): ~TopologyClusterer()
+        // calls cudaFreeAsync(..., cluster_stream_), so it has to run while
+        // cluster_stream_ is still alive. Deleting it explicitly here, in
+        // this destructor's *body*, guarantees that -- member destructors
+        // (including cluster_stream_'s, a StreamGuard) only run after this
+        // body finishes. This is the exact bug the top-level
+        // smoke_test_clustering.cu hit when TopologyClusterer's stream was
+        // destroyed before the object was -- see that file's fix for the
+        // full writeup.
+        delete clusterer_;
+        clusterer_ = nullptr;
 
         delete gpu_mirror_;
 
-        if (h_harmonic_out_) cudaFreeHost(h_harmonic_out_);
-        if (h_curl_out_)     cudaFreeHost(h_curl_out_);
-        if (h_edge_src_)     cudaFreeHost(h_edge_src_);
-        if (h_edge_dst_)     cudaFreeHost(h_edge_dst_);
+        if (h_harmonic_out_)      cudaFreeHost(h_harmonic_out_);
+        if (h_curl_out_)          cudaFreeHost(h_curl_out_);
+        if (h_edge_src_)          cudaFreeHost(h_edge_src_);
+        if (h_edge_dst_)          cudaFreeHost(h_edge_dst_);
+        if (h_cluster_features_)  cudaFreeHost(h_cluster_features_);
+        if (d_cluster_features_)  device_free(d_cluster_features_);
     }
 
     void CudaPipeline::init_gpu(int device)
@@ -285,32 +319,69 @@ namespace holo::cuda
         rec.floer_instanton_found = floer.instanton_found;
     }
 
+    // Stage V + wiring into stage VI: each SignalRecord already holds a
+    // per-tick (S_YM, max|γ|, mean|γ|, β₁) reduction -- yang_mills_action,
+    // max_curl, mean_curl, floer_HF1 -- computed in record_signal() /
+    // run_floer_pass() above. "Building the feature window" is therefore
+    // just gathering the k_cluster_window most recent SignalRecords out of
+    // the signal_history_ ring buffer into a dense [window x 4] matrix and
+    // uploading it, not a new aggregation kernel.
+    void CudaPipeline::build_cluster_window_and_fit()
+    {
+        const std::uint64_t total =
+            signal_write_idx_.load(std::memory_order_acquire);
+
+        // Not enough history yet to fill a full window.
+        if (total < static_cast<std::uint64_t>(k_cluster_window))
+            return;
+
+        // Throttle: refit every k_cluster_refit_every new signals, not
+        // every tick -- keeps DBSCAN off the <1ms per-tick hot path (see
+        // the note in ai/cuml_clustering.cu and the k_cluster_* comments
+        // in cuda_pipeline.cuh).
+        if (total - last_cluster_refit_signal_count_ < k_cluster_refit_every)
+            return;
+
+        for (int i = 0; i < k_cluster_window; ++i)
+        {
+            const std::uint64_t src_idx =
+                (total - static_cast<std::uint64_t>(k_cluster_window) + static_cast<std::uint64_t>(i))
+                % k_signal_history_len;
+            const SignalRecord &rec = signal_history_[src_idx];
+
+            float *row = h_cluster_features_ + static_cast<std::size_t>(i) * k_cluster_features;
+            row[0] = rec.yang_mills_action;
+            row[1] = rec.max_curl;
+            row[2] = rec.mean_curl;
+            row[3] = static_cast<float>(rec.floer_HF1); // β₁
+        }
+
+        CUDA_CHECK(cudaMemcpyAsync(
+            d_cluster_features_, h_cluster_features_,
+            static_cast<std::size_t>(k_cluster_window) * k_cluster_features * sizeof(float),
+            cudaMemcpyHostToDevice, cluster_stream_.get()));
+
+        // fit() synchronizes cluster_stream_ internally before returning
+        // (it reads labels back to host), so this call is blocking with
+        // respect to cluster_stream_ but never touches compute_stream_ /
+        // signal_stream_ -- the per-tick hot path is unaffected.
+        clusterer_->fit(d_cluster_features_, k_cluster_window, k_cluster_features);
+
+        last_cluster_refit_signal_count_ = total;
+    }
+
     void CudaPipeline::run_once()
     {
         transfer_lob_to_gpu();
         run_spectral_pruning();
         run_hodge_decomposition();
 
-        // ---- TEMP DIAGNOSTIC: trace pipeline stage reach/exit ----
-        {
-            static int s_diag2_calls = 0;
-            if (s_diag2_calls < 8)
-            {
-                std::fprintf(stderr,
-                    "[DIAG2 %d] laplacian.n_rows=%d laplacian.nnz=%d hodge_ws_.n_edges=%d "
-                    "n_instruments=%u\n",
-                    s_diag2_calls, laplacian_.n_rows, laplacian_.nnz, hodge_ws_.n_edges,
-                    static_cast<unsigned>(lob_soa_.n_instruments()));
-                ++s_diag2_calls;
-            }
-        }
-        // ---- END TEMP DIAGNOSTIC ----
-
         if (hodge_ws_.n_edges > 0)
         {
             ArbitrageSignal sig = extract_arbitrage_signal(hodge_ws_, compute_stream_);
             CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
             record_signal(sig);
+            build_cluster_window_and_fit();
         }
     }
 
