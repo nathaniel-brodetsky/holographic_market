@@ -241,6 +241,13 @@ private:
         beast::get_lowest_layer(*ws_).expires_after(std::chrono::seconds(30));
         co_await beast::get_lowest_layer(*ws_).async_connect(results, asio::use_awaitable);
 
+        // This socket carries order entry -- infrequent, small, latency-
+        // critical messages, exactly the pattern Nagle's algorithm plus
+        // the far end's delayed ACK hurts most (can add tens of ms to
+        // getting a single order request onto the wire). Must be set
+        // after connect, before anything is written.
+        beast::get_lowest_layer(*ws_).socket().set_option(tcp::no_delay(true));
+
         if (!SSL_set_tlsext_host_name(ws_->next_layer().native_handle(), host_.c_str())) {
             throw beast::system_error(beast::error_code(
                 static_cast<int>(::ERR_get_error()), asio::error::get_ssl_category()));
