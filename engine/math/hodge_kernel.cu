@@ -397,6 +397,7 @@ namespace holo::cuda
         ws.d_edge_src = device_alloc<int>(ne);
         ws.d_edge_dst = device_alloc<int>(ne);
         ws.d_triangle_edges = device_alloc<int>(nt * 3U);
+        ws.d_count = device_alloc<int>(1U);
 
         CUDA_CHECK(cudaMemsetAsync(ws.d_B1, 0, nn * ne * sizeof(float), stream));
         CUDA_CHECK(cudaMemsetAsync(ws.d_B2, 0, ne * nt * sizeof(float), stream));
@@ -637,8 +638,15 @@ namespace holo::cuda
         HodgeWorkspace &ws,
         cudaStream_t stream)
     {
-        int *d_count = device_alloc<int>(1U);
-        CUDA_CHECK(cudaMemsetAsync(d_count, 0, sizeof(int), stream));
+        // ws.d_count is allocated ONCE in hodge_workspace_init() and lives
+        // for the pipeline's whole lifetime -- this used to
+        // cudaMalloc/cudaFree a fresh one-int buffer on every single call
+        // (every ~1ms tick). cudaFree is a synchronous, implicitly
+        // device-wide-synchronizing call -- usually fast (allocator
+        // free-list reuse) but a real suspect for occasional multi-second
+        // stalls under allocator contention. See HodgeWorkspace::d_count
+        // in hodge_kernel.cuh.
+        CUDA_CHECK(cudaMemsetAsync(ws.d_count, 0, sizeof(int), stream));
 
         const int blk = k_blk;
         const int grd = (ws.n_edges + blk - 1) / blk;
@@ -646,14 +654,13 @@ namespace holo::cuda
         if (ws.n_edges > 0)
         {
             kernel_count_active_loops<<<grd, blk, 0, stream>>>(
-                ws.d_arb_signal, ws.n_edges, d_count);
+                ws.d_arb_signal, ws.n_edges, ws.d_count);
         }
 
         int h_count = 0;
-        CUDA_CHECK(cudaMemcpyAsync(&h_count, d_count,
+        CUDA_CHECK(cudaMemcpyAsync(&h_count, ws.d_count,
                                    sizeof(int), cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
-        device_free(d_count);
 
         struct timespec ts{};
         clock_gettime(CLOCK_MONOTONIC_RAW, &ts);

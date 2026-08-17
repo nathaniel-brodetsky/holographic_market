@@ -57,6 +57,9 @@ enum class Stage : std::uint32_t
     RingPopToLobApply,       // ring pop -> LobSoA updated (drain_thread)
     GpuRunOnce,               // CudaPipeline::run_once() wall time
     SignalToOrderSend,        // SignalRecord.timestamp_ns -> co_spawn(on_signal)
+    PollWakeToSignalNoticed,  // SignalRecord.timestamp_ns -> main loop noticing
+                              // it's new (subset of SignalToOrderSend's span --
+                              // see the comment at its call site in main_live.cpp)
     COUNT
 };
 
@@ -68,6 +71,7 @@ enum class Stage : std::uint32_t
         case Stage::RingPopToLobApply: return "ring_pop_to_lob_apply";
         case Stage::GpuRunOnce:        return "gpu_run_once";
         case Stage::SignalToOrderSend: return "signal_to_order_send";
+        case Stage::PollWakeToSignalNoticed: return "poll_wake_to_signal_noticed";
         default:                       return "unknown";
     }
 }

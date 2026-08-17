@@ -70,40 +70,68 @@ public:
         const std::size_t n_edges = h_curl_flow.size();
         if (n_edges == 0U) return 0U;
 
-        struct Candidate { float abs_flow; std::size_t idx; };
+        // Instrument-disjoint top-K. Picking the raw top-K edges by
+        // strength (the old approach) can select several edges that all
+        // share one instrument (e.g. BTC is in 3 of the 6 edges of a
+        // 4-instrument complete graph) -- those then race each other to
+        // the exchange, all priced off the same local book snapshot for
+        // that shared instrument. By the time the second/third order
+        // arrives, the first may have already moved the real book, so
+        // they're no longer valid post-only prices -- this is what was
+        // producing repeated "could not be executed as maker" rejects
+        // and tripping the circuit breaker, even after adding a
+        // one-tick pricing safety margin (see main_live.cpp
+        // safe_maker_price()) -- the margin doesn't help when the
+        // *same* instrument gets re-priced by a second in-flight order
+        // a couple milliseconds later.
+        //
+        // Fix: greedily fill each of the k_signal_router_top_k output
+        // slots with the strongest remaining edge whose BOTH endpoints
+        // are not yet claimed by an edge already selected in this same
+        // call. Guarantees every edge in one routed batch touches
+        // disjoint instruments. O(top_k * n_edges), no allocation --
+        // n_edges is small (6 for today's 4-instrument complete graph),
+        // so this is cheap even though it's less clever than the old
+        // running-min-slot scan.
+        static constexpr std::uint32_t kNoInstrument = 0xFFFFFFFFU;
+        std::array<std::uint32_t, k_signal_router_top_k * 2U> used_instruments{};
+        for (auto& u : used_instruments) u = kNoInstrument;
+        std::size_t n_used = 0U;
 
-        // FIX: initialise to 0.0F, not -1.0F
-        // With -1.0F, zero-flow edges would beat the sentinel and pollute output.
-        std::array<Candidate, k_signal_router_top_k> top{};
-        for (auto& c : top) { c.abs_flow = 0.0F; c.idx = 0U; }
-
-        for (std::size_t e = 0U; e < n_edges; ++e)
-        {
-            const float af = (h_curl_flow[e] < 0.0F) ? -h_curl_flow[e] : h_curl_flow[e];
-            if (af < active_threshold()) continue;  // FIX: skip sub-threshold early
-
-            // Find minimum slot
-            std::size_t min_pos = 0U;
-            for (std::size_t t = 1U; t < k_signal_router_top_k; ++t)
-                if (top[t].abs_flow < top[min_pos].abs_flow) min_pos = t;
-
-            if (af > top[min_pos].abs_flow)
-                top[min_pos] = {af, e};
-        }
-
-        std::sort(top.begin(), top.end(),
-            [](const Candidate& a, const Candidate& b) noexcept
-            { return a.abs_flow > b.abs_flow; });
+        const auto is_used = [&](std::uint32_t instr) noexcept {
+            for (std::size_t i = 0U; i < n_used; ++i)
+                if (used_instruments[i] == instr) return true;
+            return false;
+        };
 
         std::size_t written = 0U;
-        for (std::size_t t = 0U; t < k_signal_router_top_k; ++t)
+        for (std::size_t slot = 0U; slot < k_signal_router_top_k; ++slot)
         {
-            // FIX: skip zero-flow slots (unfilled top-K positions)
-            if (top[t].abs_flow < active_threshold()) break;
+            float       best_af  = 0.0F;
+            std::size_t best_idx = n_edges;
+            bool        found    = false;
 
-            const std::size_t e = top[t].idx;
-            if (e >= h_edge_src.size()) break;
+            for (std::size_t e = 0U; e < n_edges; ++e)
+            {
+                const float af = (h_curl_flow[e] < 0.0F) ? -h_curl_flow[e] : h_curl_flow[e];
+                if (af < active_threshold()) continue;
+                if (e >= h_edge_src.size() || e >= h_edge_dst.size()) continue;
 
+                const auto src = static_cast<std::uint32_t>(h_edge_src[e]);
+                const auto dst = static_cast<std::uint32_t>(h_edge_dst[e]);
+                if (is_used(src) || is_used(dst)) continue;
+
+                if (!found || af > best_af)
+                {
+                    best_af  = af;
+                    best_idx = e;
+                    found    = true;
+                }
+            }
+
+            if (!found) break;
+
+            const std::size_t e = best_idx;
             auto& re = out_buf[written];
             re.src_instrument    = static_cast<std::uint32_t>(h_edge_src[e]);
             re.dst_instrument    = static_cast<std::uint32_t>(h_edge_dst[e]);
@@ -113,6 +141,9 @@ public:
             re.edge_index        = static_cast<std::uint32_t>(e);
             re._pad              = 0U;
             ++written;
+
+            used_instruments[n_used++] = re.src_instrument;
+            used_instruments[n_used++] = re.dst_instrument;
         }
 
         metrics_.edges_routed.fetch_add(written, std::memory_order_relaxed);
@@ -127,5 +158,3 @@ private:
 };
 
 } // namespace holo::net
-
-namespace holo { using namespace holo::net; }

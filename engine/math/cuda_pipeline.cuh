@@ -198,6 +198,18 @@ public:
 
     [[nodiscard]] const PipelineMetrics &metrics() const noexcept { return metrics_; }
 
+    // Diagnostic for tracking down poll_wake_to_signal_noticed spikes:
+    // how many consecutive run_once() ticks had zero edges survive
+    // spectral pruning (record_signal() -- and signal_write_idx_ -- don't
+    // advance during such a streak, so last_signal() keeps returning a
+    // stale timestamp for the whole stretch).
+    [[nodiscard]] std::uint64_t zero_edge_streak_max() const noexcept {
+        return zero_edge_streak_max_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::uint64_t zero_edge_ticks_total() const noexcept {
+        return zero_edge_ticks_total_.load(std::memory_order_relaxed);
+    }
+
     [[nodiscard]] SignalRecord last_signal() const noexcept
     {
         const std::uint64_t write_idx =
@@ -268,6 +280,11 @@ private:
 
     std::uint64_t last_lob_generation_{0U};
     int           sm_count_{0};
+
+    // See zero_edge_streak_max()/zero_edge_ticks_total() above.
+    std::atomic<std::uint64_t> zero_edge_streak_current_{0U};
+    std::atomic<std::uint64_t> zero_edge_streak_max_{0U};
+    std::atomic<std::uint64_t> zero_edge_ticks_total_{0U};
 };
 
 } // namespace holo::cuda

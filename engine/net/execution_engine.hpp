@@ -338,12 +338,25 @@ public:
         const std::string pair_key = leg1.symbol + "|" + leg2.symbol;
         {
             std::lock_guard lk(inflight_mtx_);
-            if (!inflight_pairs_.insert(pair_key).second) {
+            // Symbol-level check FIRST, before touching inflight_pairs_ at
+            // all: two different pair_keys can share one leg (e.g.
+            // "BTCUSDT|SOLUSDT" and "BTCUSDT|BNBUSDT" both touch BTCUSDT).
+            // The pair-level check alone lets consecutive ticks a couple ms
+            // apart each pick a different pair sharing one instrument, race
+            // each other to the exchange, and get priced off a book
+            // snapshot for that shared instrument that's already stale by
+            // the second order's arrival.
+            if (inflight_symbols_.count(leg1.symbol) || inflight_symbols_.count(leg2.symbol)) {
                 throttled_log(last_dup_log_ns_, dup_drops_suppressed_,
                               "duplicate signal for " + pair_key +
-                                  " while a previous pair on it is still in flight");
+                                  " -- " + leg1.symbol + " or " + leg2.symbol +
+                                  " already has an unresolved arb in flight "
+                                  "(possibly via a different pair)");
                 co_return;
             }
+            inflight_pairs_.insert(pair_key);
+            inflight_symbols_.insert(leg1.symbol);
+            inflight_symbols_.insert(leg2.symbol);
         }
         // Guarantees the pair_key entry is removed if anything between here
         // and the co_spawn below throws (e.g. the gateway send failing) —
@@ -500,10 +513,28 @@ private:
                 release_terminal(resting_key);
                 co_return;  // both legs filled — arb complete, maker fees on both sides
             }
-            // Resting leg was Canceled/Rejected on its own (e.g. GTX
-            // reject) — no exposure on that leg; fall through, but there
-            // is nothing to cancel and nothing to hedge for *this* leg.
+            // BUG FIX: the resting leg reached a terminal
+            // Canceled/Rejected state on its own (e.g. a GTX post-only
+            // reject) within kLegTimeout -- that leg itself has zero
+            // exposure, correct. But the FIRST leg (first_rec, above)
+            // already filled and had apply_fill_pnl() applied to it, and
+            // this branch used to co_return here without ever hedging
+            // that exposure -- leaving a bare, unhedged directional
+            // position on whatever instrument the first leg traded. This
+            // is exactly what the live BTCUSDT position with no
+            // offsetting leg was: BTC filled, the resting leg
+            // GTX-rejected on its own within the timeout window, and this
+            // branch silently walked away from the now-unhedged BTC
+            // exposure. The timeout branch further down this function
+            // already calls hedge_remaining() for the structurally
+            // identical situation (resting leg fails to fill) -- this
+            // just applies the same treatment to the "failed via its own
+            // terminal state" path instead of "failed via timing out".
+            if (resting_rec.filled_qty > 0.0) {
+                apply_fill_pnl(resting_rec, resting_leg);  // partial fill before the reject/cancel
+            }
             release_terminal(resting_key);
+            co_await hedge_remaining(resting_leg, resting_rec.qty - resting_rec.filled_qty);
             co_return;
         }
         // else: 50ms elapsed with the resting leg still live — intervene.
@@ -755,6 +786,14 @@ private:
     void clear_inflight(const std::string& pair_key) {
         std::lock_guard lk(inflight_mtx_);
         inflight_pairs_.erase(pair_key);
+        // pair_key is always "symbol1|symbol2" (see on_signal()) -- free
+        // both legs' symbols so a different pair sharing one of them can
+        // now proceed.
+        const auto sep = pair_key.find('|');
+        if (sep != std::string::npos) {
+            inflight_symbols_.erase(pair_key.substr(0, sep));
+            inflight_symbols_.erase(pair_key.substr(sep + 1));
+        }
     }
 
     // Best-effort: lets an external monitor/supervisor (cron, systemd
@@ -809,6 +848,10 @@ private:
     // the dedup guard in on_signal().
     std::mutex inflight_mtx_;
     std::unordered_set<std::string> inflight_pairs_;
+    // Individual symbols currently claimed by some in-flight pair -- see
+    // the dedup guard in on_signal(). A symbol is free (absent from this
+    // set) only when it isn't a leg of ANY currently in-flight pair.
+    std::unordered_set<std::string> inflight_symbols_;
 
     // RAII cleanup for an inflight_pairs_ entry — see on_signal() for why
     // this exists (an exception between insert and co_spawn must not leave

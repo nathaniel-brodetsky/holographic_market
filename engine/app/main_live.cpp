@@ -73,6 +73,54 @@ std::string fetch_listen_key(const std::string& api_key) {
     throw std::runtime_error("Failed to get listenKey. Response: " + body);
 }
 
+
+void renew_listen_key(const std::string& api_key) {
+    namespace beast = boost::beast;
+    namespace http = beast::http;
+    namespace asio = boost::asio;
+    namespace ssl = asio::ssl;
+
+    asio::io_context ioc;
+    ssl::context ctx(ssl::context::tlsv12_client);
+    ctx.set_default_verify_paths();
+
+    asio::ip::tcp::resolver resolver(ioc);
+    beast::ssl_stream<beast::tcp_stream> stream(ioc, ctx);
+
+    auto const results = resolver.resolve("testnet.binancefuture.com", "443");
+    beast::get_lowest_layer(stream).connect(results);
+
+    if(!SSL_set_tlsext_host_name(stream.native_handle(), "testnet.binancefuture.com")) {
+        throw std::runtime_error("SNI Failed");
+    }
+
+    stream.handshake(ssl::stream_base::client);
+
+    http::request<http::empty_body> req{http::verb::put, "/fapi/v1/listenKey", 11};
+    req.set(http::field::host, "testnet.binancefuture.com");
+    req.set("X-MBX-APIKEY", api_key);
+
+    http::write(stream, req);
+
+    beast::flat_buffer buffer;
+    http::response<http::string_body> res;
+    http::read(stream, buffer, res);
+
+    beast::error_code ec;
+    stream.shutdown(ec);
+
+    if (res.result_int() != 200) {
+        throw std::runtime_error("listenKey keepalive failed (status=" +
+            std::to_string(res.result_int()) + "): " + res.body());
+    }
+}
+
+double safe_maker_price(std::string_view symbol, bool is_buy, double touch_price) {
+    double tick = 1.0;
+    for (int i = 0; i < holo::net::detail::precision_for(symbol).price_decimals; ++i) tick /= 10.0;
+    return is_buy ? touch_price - tick : touch_price + tick;
+}
+
 int main() {
     // --- 1. CONFIGURATION ---
     // Credentials must never live in source (they end up in git history and
@@ -151,6 +199,22 @@ int main() {
     });
 
     std::atomic<bool> shutdown{false};
+    std::thread listen_key_keepalive_thread{[&]() {
+    // listenKey живёт 60 минут; обновляем раз в 30 — с запасом, если
+    // один цикл вдруг сорвётся (сетевой сбой и т.п.).
+    const auto interval = std::chrono::minutes(30);
+    while (!shutdown.load(std::memory_order_relaxed)) {
+        std::this_thread::sleep_for(interval);
+        if (shutdown.load(std::memory_order_relaxed)) break;
+        try {
+            renew_listen_key(api_key);
+            std::cerr << "[ListenKeyKeepalive] renewed OK\n";
+        } catch (const std::exception& e) {
+            std::cerr << "[ListenKeyKeepalive] renew failed: " << e.what()
+                      << " -- will retry next cycle\n";
+        }
+    }
+}};
     std::thread pipeline_thread{[&]() { pipeline.run_continuous(shutdown); }};
     std::thread drain_thread{[&]() {
         while(!shutdown.load(std::memory_order_relaxed)) {
@@ -178,6 +242,10 @@ int main() {
             std::cout << "\n[PNL] Live MTM PnL (Realized + Unrealized): " << std::fixed << std::setprecision(4) << total << " USD | Live Orders in Book: " << oms.live_order_count() << "\n";
 
             holo::core::g_latency.dump(stdout);
+            std::cout << "[ZeroEdgeDiag] longest zero-edge streak: "
+                      << pipeline.zero_edge_streak_max() << " ticks ("
+                      << (pipeline.zero_edge_streak_max() / 1000.0) << "s @ 1ms/tick), "
+                      << "total zero-edge ticks: " << pipeline.zero_edge_ticks_total() << "\n";
         }
     }};
 
@@ -191,6 +259,12 @@ int main() {
         auto sig = pipeline.last_signal();
         if (sig.timestamp_ns != last_sig_ts && sig.timestamp_ns != 0) {
             last_sig_ts = sig.timestamp_ns;
+
+            // Measures ONLY "GPU decided -> main loop noticed", separate
+            // from SignalToOrderSend's full "GPU decided -> order
+            // dispatched" span -- see core/latency_trace.hpp for why.
+            holo::core::g_latency.record(holo::core::Stage::PollWakeToSignalNoticed,
+                holo::core::latency_now_ns() - sig.timestamp_ns);
 
             auto topo = pipeline.last_topology();
             if (topo.n_edges > 0) {
@@ -232,15 +306,16 @@ int main() {
                         sym1,
                         is_long ? holo::net::Side::Buy : holo::net::Side::Sell,
                         order_size_usd / lob_ptr->mid_price(edge.src_instrument),
-                        is_long ? lob_ptr->best_bid(edge.src_instrument) : lob_ptr->best_ask(edge.src_instrument)
+                        safe_maker_price(sym1, is_long,
+                            is_long ? lob_ptr->best_bid(edge.src_instrument) : lob_ptr->best_ask(edge.src_instrument))
                     };
-
-                    // Нога 2 (Зеркальная лимитка)
+                    
                     ExecutionEngine::ArbLeg leg2{
                         sym2,
                         is_long ? holo::net::Side::Sell : holo::net::Side::Buy,
                         order_size_usd / lob_ptr->mid_price(edge.dst_instrument),
-                        is_long ? lob_ptr->best_ask(edge.dst_instrument) : lob_ptr->best_bid(edge.dst_instrument)
+                        safe_maker_price(sym2, !is_long,
+                            is_long ? lob_ptr->best_ask(edge.dst_instrument) : lob_ptr->best_bid(edge.dst_instrument))
                     };
 
                     std::cout << "[SIGNAL] S_YM=" << sig.yang_mills_action << " | Placing Maker Limits for " << leg1.symbol << " & " << leg2.symbol << "\n";
