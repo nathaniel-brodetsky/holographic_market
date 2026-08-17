@@ -3,6 +3,7 @@
 #include <math/cuda_utils.cuh>
 #include <math/hodge_kernel.cuh>
 #include <math/lobpcg_solver.cuh>
+#include <core/latency_trace.hpp>
 
 #include <cstdio>
 #include <cstring>
@@ -372,9 +373,12 @@ namespace holo::cuda
 
     void CudaPipeline::run_once()
     {
+        const uint64_t t_run_once_start = pipeline_now_ns();
+
         transfer_lob_to_gpu();
         run_spectral_pruning();
         run_hodge_decomposition();
+
 
         if (hodge_ws_.n_edges > 0)
         {
@@ -383,6 +387,9 @@ namespace holo::cuda
             record_signal(sig);
             build_cluster_window_and_fit();
         }
+
+        core::g_latency.record(core::Stage::GpuRunOnce,
+                                pipeline_now_ns() - t_run_once_start);
     }
 
     void CudaPipeline::run_continuous(std::atomic<bool> &shutdown_flag)

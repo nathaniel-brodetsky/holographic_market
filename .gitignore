@@ -19,7 +19,7 @@ CMakeFiles/
 *.log
 
 data/test_data.csv
-data/advanced_metrics.csvdata/
+data/advanced_metrics.csv
 *.csv
 !infra/*.csv
 multi_day_results.txt
@@ -28,3 +28,6 @@ multi_day_results.txt
 /Miniforge3-Linux-x86_64.sh
 /data/
 /engine/simdjson/
+
+# runtime artifacts (circuit breaker halt flag etc.)
+holo_halt.flag

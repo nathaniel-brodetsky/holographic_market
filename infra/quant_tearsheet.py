@@ -26,7 +26,16 @@ def load_data():
     df = pd.read_csv(CSV_PATH)
     df["trade_idx"] = np.arange(len(df))
     rmax = np.maximum.accumulate(df["cumulative_pnl"])
-    df["drawdown_pct"] = np.where(rmax != 0, (df["cumulative_pnl"] - rmax) / np.abs(rmax) * 100.0, 0.0)
+    # Absolute bps drawdown from the running peak, NOT a percentage.
+    # cumulative_pnl is already in bps -- it isn't a capital/notional
+    # value, so "% of peak PnL" isn't a meaningful unit here, and it
+    # blows up whenever the running peak is near zero (early in a run,
+    # or on a losing run that never gets far from zero): a swing from
+    # +2 bps to -48 bps peak-to-trough reads as -2500% under that
+    # formula, even though the actual bps drawdown is a modest 50bps.
+    # Absolute bps has no such singularity and is the more honest,
+    # directly comparable number across different runs' PnL scale.
+    df["drawdown_bps"] = df["cumulative_pnl"] - rmax
     return df
 
 def plot_equity(ax, df):
@@ -36,9 +45,9 @@ def plot_equity(ax, df):
     ax.grid(True)
 
 def plot_drawdown(ax, df):
-    ax.plot(df["trade_idx"], df["drawdown_pct"], color="#f85149", lw=1.2)
-    ax.fill_between(df["trade_idx"], df["drawdown_pct"], 0, color="#f85149", alpha=0.3)
-    ax.set_title("2. Underwater Plot (Drawdown %)", fontweight="bold")
+    ax.plot(df["trade_idx"], df["drawdown_bps"], color="#f85149", lw=1.2)
+    ax.fill_between(df["trade_idx"], df["drawdown_bps"], 0, color="#f85149", alpha=0.3)
+    ax.set_title("2. Underwater Plot (Drawdown, bps)", fontweight="bold")
     ax.grid(True)
 
 def plot_pnl_dist(ax, df):

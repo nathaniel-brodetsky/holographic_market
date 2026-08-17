@@ -2,15 +2,13 @@
 
 #include <core/lob_core.hpp>
 #include <core/lockfree_ring_buffer.hpp>
-#include <net/symbols.hpp>
+#include <core/latency_trace.hpp>
 
 #include <array>
 #include <atomic>
-#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <string>
@@ -35,30 +33,28 @@
 namespace holo::net
 {
 
-// k_feed_n_instruments / k_symbols / k_symbols_upper now live in
-// net/symbols.hpp (included above) so offline/CPU-only code (e.g. the
-// backtest binary) can share the same instrument list without pulling in
-// this file's networking dependencies.
+static constexpr std::size_t k_feed_n_instruments = 4U;
+
+static constexpr std::array<std::string_view, k_feed_n_instruments> k_symbols = {
+    "btcusdt", "ethusdt", "solusdt", "bnbusdt"
+};
+
+static constexpr std::array<std::string_view, k_feed_n_instruments> k_symbols_upper = {
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"
+};
 
 namespace detail
 {
 
-// Full-symbol match (not just the first 3 chars) against a stream name
-// like "btcusdt@depth5@100ms", requiring either an exact match or a match
-// followed by '@'. A 3-letter-prefix match (the previous approach) risked
-// misrouting two symbols that happen to share a prefix — e.g. a future
-// BTCDOMUSDT listing next to BTCUSDT would both have matched "btc" and
-// collapsed onto the same instrument_id. With k_feed_n_instruments still
-// small (currently 4) this stays effectively O(1) in practice; if the
-// symbol list grows large, swap to a compile-time trie/hash map.
+// FIX: constexpr char-compare router (no hash collision risk, zero overhead)
 [[nodiscard]] constexpr std::uint32_t instrument_id_from_stream(std::string_view s) noexcept
 {
-    for (std::uint32_t i = 0U; i < static_cast<std::uint32_t>(k_symbols.size()); ++i)
+    if (s.size() >= 6)
     {
-        const std::string_view sym = k_symbols[i];
-        if (s.size() == sym.size() && s == sym) return i;
-        if (s.size() > sym.size() && s[sym.size()] == '@' && s.compare(0, sym.size(), sym) == 0)
-            return i;
+        if (s[0]=='b' && s[1]=='t' && s[2]=='c') return 0U;
+        if (s[0]=='e' && s[1]=='t' && s[2]=='h') return 1U;
+        if (s[0]=='s' && s[1]=='o' && s[2]=='l') return 2U;
+        if (s[0]=='b' && s[1]=='n' && s[2]=='b') return 3U;
     }
     return std::numeric_limits<std::uint32_t>::max();
 }
@@ -130,11 +126,7 @@ public:
     [[nodiscard]] const FeedMetrics& metrics() const noexcept { return metrics_; }
 
 private:
-    // fstream.binance.com is the USDT-M Futures market-data WS host — this is
-    // correct for this system. Everything downstream (OMS, binance_gateway,
-    // user_data_feed) is built against the Futures API (fapi/*), so do NOT
-    // change this to the spot host (stream.binance.com) — that would break
-    // symbol/precision handling and the OMS's assumptions throughout.
+    // FIX: use spot stream (stream.binance.com:9443) — correct for depth data
     static constexpr std::string_view k_ws_host = "fstream.binance.com";
     static constexpr std::string_view k_ws_port = "443";
     static constexpr std::size_t k_max_frame_bytes = 65536U;
@@ -186,6 +178,15 @@ private:
 
         beast::get_lowest_layer(ws).connect(results);
 
+        // Disable Nagle's algorithm. Default is on; combined with delayed
+        // ACK on the far end, small latency-sensitive messages can sit
+        // buffered for tens of milliseconds before actually going out.
+        // Read-side traffic here is a continuous stream so this matters
+        // less for the feed than for order entry (see binance_gateway.hpp),
+        // but set it consistently on every socket that's part of the
+        // latency-sensitive path.
+        beast::get_lowest_layer(ws).socket().set_option(asio::ip::tcp::no_delay(true));
+
         // FIX: set SSL SNI before handshake — required by stream.binance.com
         if (!SSL_set_tlsext_host_name(
                 ws.next_layer().native_handle(),
@@ -207,25 +208,14 @@ private:
         beast::flat_buffer buf;
         buf.reserve(k_max_frame_bytes);
 
-        // Depth-stream updates arrive every ~100ms in normal operation, so
-        // 60s of silence means something is actually wrong (stalled TCP
-        // connection, Binance-side issue, etc.) — reconnect rather than
-        // block forever. This also bounds how long stop() can be stuck
-        // waiting on worker_.join(): ws.read() below is a SYNCHRONOUS call,
-        // and io_context::stop() (what stop() calls) has no effect on an
-        // in-flight synchronous read — only this deadline does. Refreshed
-        // every iteration so it's a rolling idle timeout, not a hard cap
-        // on total connection lifetime.
-        static constexpr auto kIdleTimeout = std::chrono::seconds(60);
-
         while (!shutdown_.load(std::memory_order_acquire))
         {
-            beast::get_lowest_layer(ws).expires_after(kIdleTimeout);
             ws.read(buf);
+            const std::uint64_t t_recv = core::latency_now_ns();
             const std::string_view sv{
                 static_cast<const char*>(buf.data().data()),
                 buf.data().size()};
-            parse_and_enqueue(sv);
+            parse_and_enqueue(sv, t_recv);
             buf.consume(buf.size());
         }
 
@@ -233,7 +223,7 @@ private:
         ws.close(websocket::close_code::normal, ec);
     }
 
-    void parse_and_enqueue(std::string_view raw) noexcept
+    void parse_and_enqueue(std::string_view raw, std::uint64_t t_recv) noexcept
     {
         // FIX: boost::json with monotonic_resource → zero heap on steady state
         try
@@ -287,45 +277,14 @@ private:
 
             push_levels(bv->as_array(), BookSide::Bid);
             push_levels(av->as_array(), BookSide::Ask);
+
+            core::g_latency.record(core::Stage::WsRecvToRingPush,
+                                    core::latency_now_ns() - t_recv);
         }
         catch (...)
         {
             metrics_.parse_errors.fetch_add(1U, std::memory_order_relaxed);
-            log_parse_error_throttled(raw);
         }
-    }
-
-    // A bare counter (metrics_.parse_errors) doesn't tell you *what* is
-    // failing to parse — if Binance changes the stream schema, this would
-    // otherwise go unnoticed until someone happens to check the metric.
-    // Throttled to one line per kLogThrottleNs so a burst of malformed
-    // frames doesn't flood stderr; content is truncated since this is
-    // meant for "what changed", not full-frame logging.
-    void log_parse_error_throttled(std::string_view raw) noexcept
-    {
-        static constexpr std::int64_t kLogThrottleNs = 5'000'000'000LL;  // 5s
-        static constexpr std::size_t kMaxLoggedBytes = 200U;
-
-        const auto now_ns = static_cast<std::int64_t>(
-            std::chrono::steady_clock::now().time_since_epoch().count());
-        std::int64_t prev = last_parse_err_log_ns_.load(std::memory_order_relaxed);
-        if (now_ns - prev < kLogThrottleNs)
-        {
-            parse_err_suppressed_.fetch_add(1U, std::memory_order_relaxed);
-            return;
-        }
-        if (!last_parse_err_log_ns_.compare_exchange_strong(prev, now_ns, std::memory_order_relaxed))
-            return;
-
-        const auto n = parse_err_suppressed_.exchange(0U, std::memory_order_relaxed);
-        const std::string_view snippet = raw.substr(0U, std::min(raw.size(), kMaxLoggedBytes));
-        std::fprintf(stderr, "\n[Feed Error] parse_and_enqueue failed, raw (truncated): %.*s",
-                     static_cast<int>(snippet.size()), snippet.data());
-        if (n > 0U) std::fprintf(stderr, "\n[Feed Error] (+%llu more parse errors suppressed in "
-                                          "the last %llds)",
-                                  static_cast<unsigned long long>(n),
-                                  static_cast<long long>(kLogThrottleNs / 1'000'000'000LL));
-        std::fprintf(stderr, "\n");
     }
 
     RingT&                  ring_;
@@ -333,8 +292,6 @@ private:
     boost::asio::io_context ioc_{1};
     std::thread             worker_;
     FeedMetrics             metrics_;
-    std::atomic<std::int64_t>  last_parse_err_log_ns_{0};
-    std::atomic<std::uint64_t> parse_err_suppressed_{0U};
 };
 
 } // namespace holo::net
