@@ -201,6 +201,8 @@ endif()
 # parallel_group.hpp). The code already uses asio::any_io_executor
 # explicitly throughout net/*.hpp; this macro was silently fighting that.
 add_executable(holographic_live app/main_live.cpp)
+target_link_directories(holographic_live PRIVATE $ENV{CONDA_PREFIX}/lib)
+target_link_options(holographic_live PRIVATE -Wl,-rpath,$ENV{CONDA_PREFIX}/lib)
 holo_target_includes(holographic_live PRIVATE)
 target_link_libraries(holographic_live PRIVATE
     holo_compile_options holo_math holo_ai ${HOLO_NET_LINK_LIBS})
@@ -213,6 +215,8 @@ set_target_properties(holographic_live PROPERTIES
 
 # ── holographic_backtest ──────────────────────────────────────────────────────
 add_executable(holographic_backtest app/main_backtest.cpp)
+target_link_directories(holographic_backtest PRIVATE $ENV{CONDA_PREFIX}/lib)
+target_link_options(holographic_backtest PRIVATE -Wl,-rpath,$ENV{CONDA_PREFIX}/lib)
 holo_target_includes(holographic_backtest PRIVATE)
 target_link_libraries(holographic_backtest PRIVATE
     holo_compile_options holo_math holo_ai ${HOLO_NET_LINK_LIBS})
