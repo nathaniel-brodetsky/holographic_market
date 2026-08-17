@@ -427,34 +427,6 @@ namespace holo::cuda
         const int blk = k_blk;
         const int grd_n = (laplacian.n_rows + blk - 1) / blk;
 
-        // ---- TEMP DIAGNOSTIC: dump raw CSR contents before edge-listing ----
-        {
-            static int s_diag3_calls = 0;
-            if (s_diag3_calls < 4)
-            {
-                const int nr = laplacian.n_rows;
-                std::vector<int> h_row_ptr(nr + 1);
-                std::vector<int> h_col_idx(laplacian.nnz);
-                std::vector<float> h_values(laplacian.nnz);
-                CUDA_CHECK(cudaMemcpyAsync(h_row_ptr.data(), laplacian.d_row_ptr, (nr + 1) * sizeof(int), cudaMemcpyDeviceToHost, stream));
-                CUDA_CHECK(cudaMemcpyAsync(h_col_idx.data(), laplacian.d_col_idx, laplacian.nnz * sizeof(int), cudaMemcpyDeviceToHost, stream));
-                CUDA_CHECK(cudaMemcpyAsync(h_values.data(), laplacian.d_values, laplacian.nnz * sizeof(float), cudaMemcpyDeviceToHost, stream));
-                CUDA_CHECK(cudaStreamSynchronize(stream));
-
-                std::fprintf(stderr, "[DIAG3 %d] blk=%d grd_n=%d n_rows=%d nnz=%d k_blk=%d\n",
-                             s_diag3_calls, blk, grd_n, nr, laplacian.nnz, k_blk);
-                std::fprintf(stderr, "         row_ptr:");
-                for (int i = 0; i <= nr; ++i) std::fprintf(stderr, " %d", h_row_ptr[i]);
-                std::fprintf(stderr, "\n         col_idx:");
-                for (int i = 0; i < laplacian.nnz; ++i) std::fprintf(stderr, " %d", h_col_idx[i]);
-                std::fprintf(stderr, "\n         values :");
-                for (int i = 0; i < laplacian.nnz; ++i) std::fprintf(stderr, " %.4g", h_values[i]);
-                std::fprintf(stderr, "\n");
-
-                ++s_diag3_calls;
-            }
-        }
-        // ---- END TEMP DIAGNOSTIC ----
 
         kernel_build_edge_list_from_csr<<<grd_n, blk, 0, stream>>>(
             laplacian.d_row_ptr,
@@ -652,44 +624,6 @@ namespace holo::cuda
 
         ws.yang_mills_action = h_ym;
 
-        // ---- TEMP DIAGNOSTIC: dump first 8 calls' intermediate norms ----
-        // Prints ||omega||, ||gamma||, ||exact||, ||coexact|| and h_ym so we
-        // can see where the signal magnitude actually goes. Remove once the
-        // zero-signal issue is diagnosed.
-        {
-            static int s_diag_calls = 0;
-            if (s_diag_calls < 8)
-            {
-                std::vector<float> h_omega(ne), h_gamma(ne), h_exact(ne), h_coexact(ne);
-                CUDA_CHECK(cudaMemcpyAsync(h_omega.data(), ws.d_omega, ne * sizeof(float), cudaMemcpyDeviceToHost, stream));
-                CUDA_CHECK(cudaMemcpyAsync(h_gamma.data(), ws.d_gamma, ne * sizeof(float), cudaMemcpyDeviceToHost, stream));
-                CUDA_CHECK(cudaMemcpyAsync(h_exact.data(), ws.d_exact, ne * sizeof(float), cudaMemcpyDeviceToHost, stream));
-                CUDA_CHECK(cudaMemcpyAsync(h_coexact.data(), ws.d_coexact, ne * sizeof(float), cudaMemcpyDeviceToHost, stream));
-                CUDA_CHECK(cudaStreamSynchronize(stream));
-
-                auto norm = [](const std::vector<float> &v) {
-                    double s = 0.0;
-                    for (float x : v) s += static_cast<double>(x) * x;
-                    return std::sqrt(s);
-                };
-
-                std::fprintf(stderr,
-                    "[DIAG %d] ne=%d ||omega||=%.6g ||gamma||=%.6g ||exact||=%.6g "
-                    "||coexact||=%.6g h_ym=%.6g n_harmonic=%d\n",
-                    s_diag_calls, ne, norm(h_omega), norm(h_gamma), norm(h_exact),
-                    norm(h_coexact), h_ym, h_n_harmonic);
-                std::fprintf(stderr, "         omega[0..%d]:", ne - 1);
-                for (int i = 0; i < ne; ++i) std::fprintf(stderr, " %.6g", h_omega[i]);
-                std::fprintf(stderr, "\n         exact[0..%d]:", ne - 1);
-                for (int i = 0; i < ne; ++i) std::fprintf(stderr, " %.6g", h_exact[i]);
-                std::fprintf(stderr, "\n         coexact[0..%d]:", ne - 1);
-                for (int i = 0; i < ne; ++i) std::fprintf(stderr, " %.6g", h_coexact[i]);
-                std::fprintf(stderr, "\n");
-
-                ++s_diag_calls;
-            }
-        }
-        // ---- END TEMP DIAGNOSTIC ----
 
         device_free(d_work);
         device_free(d_info);

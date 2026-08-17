@@ -252,7 +252,7 @@ private:
             const std::uint64_t ts = static_cast<std::uint64_t>(
                 std::chrono::steady_clock::now().time_since_epoch().count());
 
-            const auto push_levels = [&](const boost::json::array& levels, Side side)
+            const auto push_levels = [&](const boost::json::array& levels, BookSide side)
             {
                 const std::size_t n = std::min(levels.size(),
                     static_cast<std::size_t>(k_max_depth));
@@ -275,8 +275,8 @@ private:
                 }
             };
 
-            push_levels(bv->as_array(), Side::Bid);
-            push_levels(av->as_array(), Side::Ask);
+            push_levels(bv->as_array(), BookSide::Bid);
+            push_levels(av->as_array(), BookSide::Ask);
 
             core::g_latency.record(core::Stage::WsRecvToRingPush,
                                     core::latency_now_ns() - t_recv);
