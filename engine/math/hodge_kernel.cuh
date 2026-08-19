@@ -34,6 +34,12 @@ struct HodgeWorkspace final
     int     *d_edge_src{nullptr};
     int     *d_edge_dst{nullptr};
     int     *d_triangle_edges{nullptr};
+    int     *d_count{nullptr};  // scratch for extract_arbitrage_signal()'s
+                                 // active-loop count -- persistent, NOT
+                                 // allocated per-call. Used to be a fresh
+                                 // cudaMalloc/cudaFree pair on every single
+                                 // tick; see extract_arbitrage_signal() in
+                                 // hodge_kernel.cu for why that mattered.
 
     int   n_nodes{0};
     int   n_edges{0};
@@ -53,7 +59,7 @@ struct HodgeWorkspace final
         ff(d_gamma); ff(d_exact); ff(d_coexact);
         ff(d_curl_magnitude); ff(d_arb_signal);
         fu(d_prune_mask);
-        fi(d_edge_src); fi(d_edge_dst); fi(d_triangle_edges);
+        fi(d_edge_src); fi(d_edge_dst); fi(d_triangle_edges); fi(d_count);
     }
 
     HodgeWorkspace(const HodgeWorkspace &)            = delete;

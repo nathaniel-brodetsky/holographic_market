@@ -273,8 +273,23 @@ namespace holo::cuda
         }
         mean_curl /= static_cast<float>(sig.n_edges);
 
+        // BUG FIX: this used to fetch_add (and thereby PUBLISH, via
+        // acq_rel, to any acquire-loading reader) the new index BEFORE
+        // run_floer_pass() -- real GPU work, not free -- and the actual
+        // write into signal_history_[idx] had even happened. A reader
+        // racing in during that window would see the new index but read
+        // stale data (whatever was in that ring slot k_signal_history_len
+        // ticks ago) -- likely THE explanation for the multi-second
+        // poll_wake_to_signal_noticed spikes this was written to chase
+        // down. Fix: compute idx via a relaxed load (safe -- this
+        // function only ever runs on the single pipeline thread, so
+        // there's no other writer to race against for signal_write_idx_
+        // itself), do ALL the payload work, write signal_history_[idx],
+        // and only THEN publish via fetch_add(..., release) -- so an
+        // acquire-loading reader is guaranteed by release-acquire
+        // happens-before to see the completed write, not a stale slot.
         const uint64_t idx =
-            signal_write_idx_.fetch_add(1U, std::memory_order_acq_rel) % k_signal_history_len;
+            signal_write_idx_.load(std::memory_order_relaxed) % k_signal_history_len;
 
         SignalRecord new_rec{
             .timestamp_ns = sig.signal_ts_ns,
@@ -287,6 +302,7 @@ namespace holo::cuda
         };
         run_floer_pass(new_rec);
         signal_history_[idx] = new_rec;
+        signal_write_idx_.fetch_add(1U, std::memory_order_release);
 
         metrics_.n_arbitrage_signals.fetch_add(1U, std::memory_order_relaxed);
         metrics_.last_ym_action.store(sig.yang_mills_action, std::memory_order_relaxed);
@@ -382,10 +398,23 @@ namespace holo::cuda
 
         if (hodge_ws_.n_edges > 0)
         {
+            zero_edge_streak_current_.store(0U, std::memory_order_relaxed);
             ArbitrageSignal sig = extract_arbitrage_signal(hodge_ws_, compute_stream_);
             CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
             record_signal(sig);
             build_cluster_window_and_fit();
+        }
+        else
+        {
+            const std::uint64_t streak =
+                zero_edge_streak_current_.fetch_add(1U, std::memory_order_relaxed) + 1U;
+            zero_edge_ticks_total_.fetch_add(1U, std::memory_order_relaxed);
+            std::uint64_t prev_max = zero_edge_streak_max_.load(std::memory_order_relaxed);
+            while (streak > prev_max &&
+                   !zero_edge_streak_max_.compare_exchange_weak(prev_max, streak,
+                                                                  std::memory_order_relaxed))
+            {
+            }
         }
 
         core::g_latency.record(core::Stage::GpuRunOnce,
