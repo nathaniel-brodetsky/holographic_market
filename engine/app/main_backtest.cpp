@@ -273,7 +273,21 @@ int main(int argc, char **argv) {
     // GPU pass (e.g. under compute-sanitizer, or just system jitter) caused
     // whole batches of market updates to be silently skipped, making the
     // backtest's signal count and win rate non-reproducible run to run.
-    constexpr std::uint64_t k_gpu_batch = 2048U;
+    // Configurable via HOLO_GPU_BATCH (default 2048, the original hardcoded
+    // value) instead of a compile-time constant -- lets a batch-size sweep
+    // run without a recompile per value. Larger batches amortize the GPU
+    // pipeline's fixed per-call overhead over more raw rows (faster), at
+    // the direct cost of sampling the order-book graph less often (the
+    // strategy sees fewer, coarser snapshots of the market) -- this is a
+    // real methodology tradeoff, not a free speedup; see the batch-size
+    // sweep comparison chart for how much it actually costs in Sharpe/PnL.
+    const std::uint64_t k_gpu_batch = [] {
+        if (const char* env = std::getenv("HOLO_GPU_BATCH")) {
+            const auto v = std::strtoull(env, nullptr, 10);
+            if (v > 0ULL) return v;
+        }
+        return 2048ULL;
+    }();
 
     std::uint64_t local_count = 0U;
     LobUpdate     u{};
@@ -330,6 +344,8 @@ int main(int argc, char **argv) {
     const auto &rm = replay.metrics();
     std::printf("  Rows read        : %llu\n", static_cast<unsigned long long>(rm.rows_read.load()));
     std::printf("  Updates dropped  : %llu\n", static_cast<unsigned long long>(rm.updates_dropped.load()));
+    std::printf("  Push wait (diag) : %.2f s (producer time spent blocked on a full ring)\n",
+                 static_cast<double>(rm.push_wait_ns.load()) / 1e9);
     pnl.flush_csv(cli.out_dir);
     return 0;
 }

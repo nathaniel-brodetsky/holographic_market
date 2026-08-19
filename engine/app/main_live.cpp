@@ -181,7 +181,8 @@ int main() {
     OMSCore oms;
 
     // UserDataFeed (Слушает исполнение ордеров по WebSocket)
-    UserDataFeed ud_feed(ioc.get_executor(), ssl_ctx, "testnet.binancefuture.com", listen_key, oms);
+    UserDataFeed ud_feed(ioc.get_executor(), ssl_ctx, "testnet.binancefuture.com",
+                         "stream.binancefuture.com", listen_key, api_key, api_secret, oms);
     ud_feed.start();
 
     // Шлюз отправки ордеров по WebSocket

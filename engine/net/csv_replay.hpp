@@ -4,6 +4,7 @@
 #include <core/lockfree_ring_buffer.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -33,6 +34,8 @@ struct alignas(64) ReplayMetrics
     std::atomic<std::uint64_t> updates_pushed{0U};
     std::atomic<std::uint64_t> updates_dropped{0U};
     std::atomic<std::uint64_t> parse_errors{0U};
+    std::atomic<std::uint64_t> push_wait_ns{0U};  // diagnostic: total time spent
+                                                    // spin-waiting on a full ring
     std::atomic<bool>          finished{false};
 };
 
@@ -231,15 +234,41 @@ private:
             ask.price         = ask_price;
             ask.quantity      = ask_qty;
 
-            if (ring_.try_push(bid)) [[likely]]
-                metrics_.updates_pushed.fetch_add(1U, std::memory_order_relaxed);
-            else
-                metrics_.updates_dropped.fetch_add(1U, std::memory_order_relaxed);
+            // BUG FIX: try_push() failing used to be treated as "drop this
+            // update and move on" -- for an OFFLINE backtest that's the
+            // wrong tradeoff. Losing data silently both corrupts the
+            // backtest result (missing fills/quotes) and inflates the
+            // reported throughput number (it measures how fast a
+            // fraction of the data was processed, not the real
+            // dataset) -- this is what caused 846.6M of 1.298B updates
+            // (65%) to be silently dropped on the full 5-month run,
+            // invisible on small single-day files where the ring never
+            // filled. Spin-wait for the consumer instead of dropping;
+            // updates_dropped should read 0 from now on for any file
+            // this actually finishes reading.
+            {
+                const auto wait_start = std::chrono::steady_clock::now();
+                while (!ring_.try_push(bid)) {
+                    __builtin_ia32_pause();
+                }
+                const auto wait_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - wait_start).count();
+                metrics_.push_wait_ns.fetch_add(static_cast<std::uint64_t>(wait_ns),
+                                                 std::memory_order_relaxed);
+            }
+            metrics_.updates_pushed.fetch_add(1U, std::memory_order_relaxed);
 
-            if (ring_.try_push(ask)) [[likely]]
-                metrics_.updates_pushed.fetch_add(1U, std::memory_order_relaxed);
-            else
-                metrics_.updates_dropped.fetch_add(1U, std::memory_order_relaxed);
+            {
+                const auto wait_start = std::chrono::steady_clock::now();
+                while (!ring_.try_push(ask)) {
+                    __builtin_ia32_pause();
+                }
+                const auto wait_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - wait_start).count();
+                metrics_.push_wait_ns.fetch_add(static_cast<std::uint64_t>(wait_ns),
+                                                 std::memory_order_relaxed);
+            }
+            metrics_.updates_pushed.fetch_add(1U, std::memory_order_relaxed);
         }
 
         ::munmap(mapped, file_size);
